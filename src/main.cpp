@@ -32,10 +32,10 @@ int TRL = 0;
 int TLR = 0;
 int TLL = 0;
 
-int pwmPin_L = 7; // 7
-int dirPin_L = 8; // 8
-int pwmPin_R = 5; // 5
-int dirPin_R = 6; // 6
+int pwmPin_L = 23; // 7
+int dirPin_L = 22; // 8
+int pwmPin_R = 14; // 5
+int dirPin_R = 20; // 6
 
 unsigned int addressFLW = 0;
 unsigned int addressFRW = 2;
@@ -52,10 +52,10 @@ unsigned int addressTRL = 18;
 unsigned int addressTLR = 20;
 unsigned int addressTLL = 22;
 
-int encoderPin_1_L = 23; //23
-int encoderPin_2_L = 22; //22
-int encoderPin_1_R = 14; //14
-int encoderPin_2_R = 20; //20
+int encoderPin_1_L = 7; //23
+int encoderPin_2_L = 8; //22
+int encoderPin_1_R = 5; //14
+int encoderPin_2_R = 4; //20
 
 bool turnBoost = false;
 bool straightBoost = false;
