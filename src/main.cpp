@@ -10,6 +10,7 @@
 #include "distance.h"
 #include "velocity.h"
 #include "odometry.h"
+#include "drive.h"
 
 int SLAVE_ADDRESS = 0x72;
 
@@ -156,6 +157,7 @@ void setup()
   Distance_Init();
   Velocity_Init();
   Odometry_Init();
+  Drive_Init();
 
   Serial5.write(0);
   Serial5.write(192);
@@ -198,31 +200,41 @@ void loop()
   {
     if (systemCounter == false)
     {
+      // Read the first byte, then the rest of the line
       int _data = Serial.read();
-      if (_data == char('m'))
+      String rest = Serial.readStringUntil('\n');
+      String fullLine = String((char)_data) + rest;
+      fullLine.trim();
+
+      // ── Task command: "T:..." ──
+      if (fullLine.startsWith("T:") || fullLine.startsWith("t:"))
+      {
+        Drive_ParseTask(fullLine);
+        data = 0;
+      }
+      // ── Existing single-char commands ──
+      else if (fullLine.length() == 1 && fullLine.charAt(0) == 'm')
       {
         Serial.print(getTeensySerial());
         Serial.print(" | ");
         Serial.println("Motion Module");
         data = 0;
       }
-      else if (_data == char('s'))
+      else if (fullLine.length() == 1 && fullLine.charAt(0) == 's')
       {
         systemCounter = true;
-        printAlter = false; // TODO: Can be Removed for fast testing
-        data = 0;           // TODO: Can be Removed for fast testing
+        printAlter = false;
+        data = 0;
         printSetting();
       }
-      else if (_data == char('p'))
+      else if (fullLine.length() == 1 && fullLine.charAt(0) == 'p')
       {
         printAlter = !printAlter;
       }
-      else if (_data != 10)
+      // ── Numeric motion command ──
+      else if (fullLine.length() >= 1 && fullLine.charAt(0) != '\n')
       {
-        // Read the rest of the line and parse as an integer
-        String numStr = Serial.readStringUntil('\n');
-        numStr = String((char)_data) + numStr; // prepend the first byte already read
-        data = numStr.toInt();
+        data = fullLine.toInt();
         startTimeControlCounter = currentTimeControlCounter;
       }
     }
@@ -242,9 +254,13 @@ void loop()
     }
   }
 
+  // Control-counter timeout: only when NOT in autonomous drive
   if (elaspedTimeControlCounter > timeConstantControlCounter)
   {
-    data = 0; // Commenting for Testing //TODO:
+    if (!Drive_IsRunning())
+    {
+      data = 0; // Commenting for Testing //TODO:
+    }
     startTimeControlCounter = currentTimeControlCounter;
   }
 
@@ -261,115 +277,125 @@ void loop()
   }
   else if (emergency < 900)
   {
-    // --- Camera stop logic ---
-    static unsigned long frontLockTime = 0;
-    static unsigned long backLockTime = 0;
-    static unsigned long camBypassTimer = 0;
-
-    // 67 = toggle camera bypass
-    if (data == 67)
+    // ── Autonomous drive mode: only Drive_Update() calls motion() ──
+    if (Drive_IsRunning())
     {
-      if (millis() - camBypassTimer >= 500)
-      {
-        camBypassTimer = millis();
-        camBypass = !camBypass;
-        Serial.println(camBypass ? "CAM BYPASS: ON (ignoring cameras)" : "CAM BYPASS: OFF (cameras active)");
-      }
+      // Manual data is ignored while a task is executing
       data = 0;
     }
-
-    // Track last motion command (skip camera cmds so _dirData always holds the real motion)
-    if (data != 101 && data != 102 && data != 201 && data != 202 && data != 67)
+    // ── Normal manual control ──
+    else
     {
-      _dirData = data;
-    }
+      // --- Camera stop logic ---
+      static unsigned long frontLockTime = 0;
+      static unsigned long backLockTime = 0;
+      static unsigned long camBypassTimer = 0;
 
-    if (!camBypass)
-    {
-      // Front camera: 101 lock, 201 release
-      if (data == 101)
+      // 67 = toggle camera bypass
+      if (data == 67)
       {
-        frontCamLocked = true;
-        frontLockTime = millis();
-        Serial.println("FRONT CAM: LOCKED");
-        // Only kill motors if current motion is a front-blocked command
-        // Front-blocked: 1 (forward), 111-120 (fwd-left curve), 121-130 (fwd-right curve)
-        if (_dirData == 1 || (_dirData >= 111 && _dirData <= 130))
+        if (millis() - camBypassTimer >= 500)
         {
-          analogWrite(pwmPin_L, 0);
-          analogWrite(pwmPin_R, 0);
-          digitalWrite(dirPin_L, LOW);
-          digitalWrite(dirPin_R, LOW);
-          data = 0;
+          camBypassTimer = millis();
+          camBypass = !camBypass;
+          Serial.println(camBypass ? "CAM BYPASS: ON (ignoring cameras)" : "CAM BYPASS: OFF (cameras active)");
         }
-        else
+        data = 0;
+      }
+
+      // Track last motion command (skip camera cmds so _dirData always holds the real motion)
+      if (data != 101 && data != 102 && data != 201 && data != 202 && data != 67)
+      {
+        _dirData = data;
+      }
+
+      if (!camBypass)
+      {
+        // Front camera: 101 lock, 201 release
+        if (data == 101)
         {
-          // Not a front-moving command (e.g. turning) — keep current motion, just block future front cmds
+          frontCamLocked = true;
+          frontLockTime = millis();
+          Serial.println("FRONT CAM: LOCKED");
+          // Only kill motors if current motion is a front-blocked command
+          // Front-blocked: 1 (forward), 111-120 (fwd-left curve), 121-130 (fwd-right curve)
+          if (_dirData == 1 || (_dirData >= 111 && _dirData <= 130))
+          {
+            analogWrite(pwmPin_L, 0);
+            analogWrite(pwmPin_R, 0);
+            digitalWrite(dirPin_L, LOW);
+            digitalWrite(dirPin_R, LOW);
+            data = 0;
+          }
+          else
+          {
+            // Not a front-moving command (e.g. turning) — keep current motion, just block future front cmds
+            data = _dirData;
+          }
+        }
+        else if (data == 201)
+        {
+          if (frontCamLocked && (millis() - frontLockTime >= 500))
+          {
+            frontCamLocked = false;
+            Serial.println("FRONT CAM: FREE");
+          }
           data = _dirData;
         }
-      }
-      else if (data == 201)
-      {
-        if (frontCamLocked && (millis() - frontLockTime >= 500))
-        {
-          frontCamLocked = false;
-          Serial.println("FRONT CAM: FREE");
-        }
-        data = _dirData;
-      }
 
-      // Back camera: 102 lock, 202 release
-      if (data == 102)
-      {
-        backCamLocked = true;
-        backLockTime = millis();
-        Serial.println("BACK CAM: LOCKED");
-        // Only kill motors if current motion is a back-blocked command
-        // Back-blocked: 2 (backward), 211-220 (bwd-left curve), 221-230 (bwd-right curve)
-        if (_dirData == 2 || (_dirData >= 211 && _dirData <= 230))
+        // Back camera: 102 lock, 202 release
+        if (data == 102)
         {
-          analogWrite(pwmPin_L, 0);
-          analogWrite(pwmPin_R, 0);
-          digitalWrite(dirPin_L, LOW);
-          digitalWrite(dirPin_R, LOW);
-          data = 0;
+          backCamLocked = true;
+          backLockTime = millis();
+          Serial.println("BACK CAM: LOCKED");
+          // Only kill motors if current motion is a back-blocked command
+          // Back-blocked: 2 (backward), 211-220 (bwd-left curve), 221-230 (bwd-right curve)
+          if (_dirData == 2 || (_dirData >= 211 && _dirData <= 230))
+          {
+            analogWrite(pwmPin_L, 0);
+            analogWrite(pwmPin_R, 0);
+            digitalWrite(dirPin_L, LOW);
+            digitalWrite(dirPin_R, LOW);
+            data = 0;
+          }
+          else
+          {
+            // Not a back-moving command (e.g. turning) — keep current motion, just block future back cmds
+            data = _dirData;
+          }
         }
-        else
+        else if (data == 202)
         {
-          // Not a back-moving command (e.g. turning) — keep current motion, just block future back cmds
+          if (backCamLocked && (millis() - backLockTime >= 500))
+          {
+            backCamLocked = false;
+            Serial.println("BACK CAM: FREE");
+          }
           data = _dirData;
         }
-      }
-      else if (data == 202)
-      {
-        if (backCamLocked && (millis() - backLockTime >= 500))
+
+        // Block commands when front camera locked: 1, 111-120, 121-130
+        if (frontCamLocked)
         {
-          backCamLocked = false;
-          Serial.println("BACK CAM: FREE");
+          if (data == 1 || (data >= 111 && data <= 130))
+            data = 0;
         }
-        data = _dirData;
+
+        // Block commands when back camera locked: 2, 211-220, 221-230
+        if (backCamLocked)
+        {
+          if (data == 2 || (data >= 211 && data <= 230))
+            data = 0;
+        }
       }
 
-      // Block commands when front camera locked: 1, 111-120, 121-130
-      if (frontCamLocked)
-      {
-        if (data == 1 || (data >= 111 && data <= 130))
-          data = 0;
-      }
+      // Update _dirData after blocking so it reflects what motion actually runs
+      if (data != 0)
+        _dirData = data;
 
-      // Block commands when back camera locked: 2, 211-220, 221-230
-      if (backCamLocked)
-      {
-        if (data == 2 || (data >= 211 && data <= 230))
-          data = 0;
-      }
+      motion(data);
     }
-
-    // Update _dirData after blocking so it reflects what motion actually runs
-    if (data != 0)
-      _dirData = data;
-
-    motion(data);
   }
 
   if (elaspedTime > timeConstant)
@@ -404,8 +430,8 @@ void loop()
     {
       bnoPrintTimer = millis();
 
-      Serial.print(data);
-      Serial.print(" | ");
+      // Serial.print(data);
+      // Serial.print(" | ");
 
       // Serial.print(" | Dist=");
       // Serial.print(distance.travelled, 3);
@@ -426,16 +452,16 @@ void loop()
 
       // Serial.println(" rad/s");
 
-      Serial.print(" | X=");
-      Serial.print(odometry.x, 3);
+      // Serial.print(" | X=");
+      // Serial.print(odometry.x, 3);
 
-      Serial.print(" | Y=");
-      Serial.print(odometry.y, 3);
+      // Serial.print(" | Y=");
+      // Serial.print(odometry.y, 3);
 
-      Serial.print(" | H=");
-      Serial.print(odometry.heading, 3);
+      // Serial.print(" | H=");
+      // Serial.print(odometry.heading, 3);
 
-      Serial.println(" rad");
+      // Serial.println(" rad");
 
       // Serial.print(" Heading=");
       // Serial.print(currentHeading);
@@ -468,4 +494,7 @@ void loop()
     bnoReadTimer = millis();
     bnoStandaloneLoop();
   }
+
+  // Autonomous drive — runs every loop() cycle for tight heading control
+  Drive_Update();
 }
