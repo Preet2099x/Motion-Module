@@ -6,6 +6,8 @@
 #include <i2c_driver.h>
 #include <TeensyThreads.h>
 #include <i2c_driver_wire.h>
+#include "distance.h"
+#include "velocity.h"
 
 int SLAVE_ADDRESS = 0x72;
 
@@ -52,10 +54,10 @@ unsigned int addressTRL = 18;
 unsigned int addressTLR = 20;
 unsigned int addressTLL = 22;
 
-int encoderPin_1_L = 7; //23
-int encoderPin_2_L = 8; //22
-int encoderPin_1_R = 5; //14
-int encoderPin_2_R = 4; //20
+int encoderPin_1_L = 7; // 23
+int encoderPin_2_L = 8; // 22
+int encoderPin_1_R = 5; // 14
+int encoderPin_2_R = 4; // 20
 
 bool turnBoost = false;
 bool straightBoost = false;
@@ -149,6 +151,9 @@ void setup()
   // Read Permanent Data
   readEEPROM();
 
+  Distance_Init();
+  Velocity_Init();
+
   Serial5.write(0);
   Serial5.write(192);
   /*
@@ -211,11 +216,11 @@ void loop()
       }
       else if (_data != 10)
       {
-          // Read the rest of the line and parse as an integer
-          String numStr = Serial.readStringUntil('\n');
-          numStr = String((char)_data) + numStr;  // prepend the first byte already read
-          data = numStr.toInt();
-          startTimeControlCounter = currentTimeControlCounter;
+        // Read the rest of the line and parse as an integer
+        String numStr = Serial.readStringUntil('\n');
+        numStr = String((char)_data) + numStr; // prepend the first byte already read
+        data = numStr.toInt();
+        startTimeControlCounter = currentTimeControlCounter;
       }
     }
     else
@@ -379,35 +384,11 @@ void loop()
     avgRPM_L = filter_L(rpm_L);
     avgRPM_R = filter_R(rpm_R);
 
-    //   if(printAlter == true) {
-    //     Serial.print(data);
-    //     Serial.print(" | ");
-    //     //Serial.print(rpmAlter);
-    //     //Serial.print(" | ");
-    //     //Serial.print(rpmAlter_T);
-    //     //Serial.print(" | ");
-    //     Serial.print(emergency);
-    //     Serial.print(" | ");
-    //     Serial.print(avgRPM_L);
-    //     Serial.print(" | ");
-    //     Serial.print(avgRPM_R);
-    //     Serial.print(" | ");
-    //     Serial.print(1.0/16*imu.eul_heading);
-    //     Serial.print(" | ");
-    //     Serial.print(1.0/16*imu.eul_roll);
-    //     Serial.print(" | ");
-    //     Serial.print(1.0/16*imu.eul_pitch);
-    //     Serial.print(" | ");
-    //     Serial.println(imu.temp);
-    //     /*Serial.print(" | ");
-    //     Serial.print((s.calib_stat >> 6) & 3);
-    //     Serial.print(" | ");
-    //     Serial.print((s.calib_stat >> 4) & 3);
-    //     Serial.print(" | ");
-    //     Serial.print((s.calib_stat >> 2) & 3);
-    //     Serial.print(" | ");
-    //     Serial.println((s.calib_stat >> 0) & 3); */
-    //  }
+    Distance_Update(
+        encoderValue_L,
+        encoderValue_R);
+
+    Velocity_Update(elaspedTime / 1000.0f);
 
     encoderValue_L = encoderValue_R = 0;
 
@@ -424,23 +405,42 @@ void loop()
       Serial.print(" Heading=");
       Serial.print(currentHeading);
 
-      Serial.print(" | Target=");
-      Serial.print(targetHeading);
+      Serial.print(" | Dist=");
+      Serial.print(distance.travelled, 3);
 
-      Serial.print(" | Error=");
-      Serial.print(pidError);
+      // Serial.print(" | Left =");
+      // Serial.print(distance.left, 3);
 
-      Serial.print(" | Corr=");
-      Serial.print(pidCorrection);
+      // Serial.print(" | Right =");
+      // Serial.println(distance.right, 3);
 
-      Serial.print(" | L=");
-      Serial.print(debugPwmL);
+      Serial.print(" | V=");
+      Serial.print(velocity.linear, 3);
 
-      Serial.print(" | R=");
-      Serial.print(debugPwmR);
+      Serial.print(" m/s");
 
-      Serial.print(" | I=");
-      Serial.println(headingIntegral);
+      Serial.print(" | W=");
+      Serial.print(velocity.angular, 3);
+
+      Serial.println(" rad/s");
+
+      // Serial.print(" | Target=");
+      // Serial.print(targetHeading);
+
+      // Serial.print(" | Error=");
+      // Serial.print(pidError);
+
+      // Serial.print(" | Corr=");
+      // Serial.print(pidCorrection);
+
+      // Serial.print(" | L=");
+      // Serial.print(debugPwmL);
+
+      // Serial.print(" | R=");
+      // Serial.print(debugPwmR);
+
+      // Serial.print(" | I=");
+      // Serial.println(headingIntegral);
     }
   }
 
