@@ -6,8 +6,10 @@
 #include <i2c_driver.h>
 #include <TeensyThreads.h>
 #include <i2c_driver_wire.h>
+
 #include "distance.h"
 #include "velocity.h"
+#include "odometry.h"
 
 int SLAVE_ADDRESS = 0x72;
 
@@ -153,6 +155,7 @@ void setup()
 
   Distance_Init();
   Velocity_Init();
+  Odometry_Init();
 
   Serial5.write(0);
   Serial5.write(192);
@@ -390,6 +393,8 @@ void loop()
 
     Velocity_Update(elaspedTime / 1000.0f);
 
+    Odometry_Update();
+
     encoderValue_L = encoderValue_R = 0;
 
     // Print debug at 200ms to avoid serial flooding
@@ -402,11 +407,8 @@ void loop()
       Serial.print(data);
       Serial.print(" | ");
 
-      Serial.print(" Heading=");
-      Serial.print(currentHeading);
-
-      Serial.print(" | Dist=");
-      Serial.print(distance.travelled, 3);
+      // Serial.print(" | Dist=");
+      // Serial.print(distance.travelled, 3);
 
       // Serial.print(" | Left =");
       // Serial.print(distance.left, 3);
@@ -414,15 +416,29 @@ void loop()
       // Serial.print(" | Right =");
       // Serial.println(distance.right, 3);
 
-      Serial.print(" | V=");
-      Serial.print(velocity.linear, 3);
+      // Serial.print(" | V=");
+      // Serial.print(velocity.linear, 3);
 
-      Serial.print(" m/s");
+      // Serial.print(" m/s");
 
-      Serial.print(" | W=");
-      Serial.print(velocity.angular, 3);
+      // Serial.print(" | W=");
+      // Serial.print(velocity.angular, 3);
 
-      Serial.println(" rad/s");
+      // Serial.println(" rad/s");
+
+      Serial.print(" | X=");
+      Serial.print(odometry.x, 3);
+
+      Serial.print(" | Y=");
+      Serial.print(odometry.y, 3);
+
+      Serial.print(" | H=");
+      Serial.print(odometry.heading, 3);
+
+      Serial.println(" rad");
+
+      // Serial.print(" Heading=");
+      // Serial.print(currentHeading);
 
       // Serial.print(" | Target=");
       // Serial.print(targetHeading);
