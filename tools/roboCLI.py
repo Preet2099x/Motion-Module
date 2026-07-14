@@ -16,7 +16,7 @@ Commands:
     F3,R90,F5   → Sends  T:F3,R90,F5,S  (auto-appends S if missing)
     1 / 15 / 0  → Sends the numeric command as-is
     m / s / p   → Sends the single-char Teensy command
-    x           → CAN lock/latch toggle (physical robot stop/release)
+    x           → CAN lock/latch toggle (physical robot stop + track cancel / release)
     quit / exit → Close the CLI
 """
 
@@ -93,7 +93,7 @@ def find_serial_port(baud: int) -> serial.Serial:
     """Try /dev/ttyACM1 then /dev/ttyACM2. Block until one connects."""
     candidates = ["/dev/ttyACM1", "/dev/ttyACM2"]
 
-    print("roboCLI — searching for Teensy...")
+    print("roboCLI  searching for Teensy...")
 
     while True:
         for port in candidates:
@@ -152,8 +152,10 @@ def main():
                     except Exception as e:
                         print(f"  Error spawning CAN lock command: {e}")
 
-                    # Stop Teensy motors immediately
-                    ser.write(b"0\n")
+                    # Cancel any running autonomous track, then stop manual motors
+                    ser.write(b"T:S\n")   # abort drive task queue on Teensy
+                    time.sleep(0.05)
+                    ser.write(b"0\n")     # zero manual motor command
                     robot_locked = True
                 else:
                     print("  [UNLATCH] Running CAN latch command in background...")

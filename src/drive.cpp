@@ -81,6 +81,19 @@ bool Drive_IsRunning()
     return (state == DRIVE_RUNNING);
 }
 
+void Drive_Cancel()
+{
+    if (state == DRIVE_RUNNING)
+    {
+        motion(0); // Ensure motors are stopped
+        queueLength = 0;
+        queueIndex  = 0;
+        state       = DRIVE_IDLE;
+        resetCommandState();
+        Serial.println("DRIVE: Task cancelled (emergency)");
+    }
+}
+
 // ─── Parse ─────────────────────────────────────────────
 
 void Drive_ParseTask(const String &raw)

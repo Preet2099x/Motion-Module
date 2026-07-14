@@ -274,9 +274,19 @@ void loop()
     analogWrite(pwmPin_L, 0);
     analogWrite(pwmPin_R, 0);
     data = 0; // TODO: Commenting for Testing'';
+
+    // Cancel any running autonomous track on the first tick of the emergency latch
+    // so that when the emergency is released the robot stays idle (free to drive manually).
+    if (emergencyAlter)
+    {
+      Drive_Cancel();
+      emergencyAlter = false;
+    }
   }
   else if (emergency < 900)
   {
+    emergencyAlter = true; // Rearm for the next latch event
+
     // ── Autonomous drive mode: only Drive_Update() calls motion() ──
     if (Drive_IsRunning())
     {
