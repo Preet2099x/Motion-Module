@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-roboCLI — Jetson CLI for the Motion Module Teensy.
+roboCLI - Jetson CLI for the Motion Module Teensy.
 
 Auto-detects the Teensy on /dev/ttyACM1 or /dev/ttyACM2 at startup.
 Retries until one is found, then enters the command REPL.
@@ -13,11 +14,16 @@ Examples:
     python roboCLI.py 9600       # custom baud rate
 
 Commands:
-    F3,R90,F5   → Sends  T:F3,R90,F5,S  (auto-appends S if missing)
-    1 / 15 / 0  → Sends the numeric command as-is
-    m / s / p   → Sends the single-char Teensy command
-    x           → CAN lock/latch toggle (physical robot stop + track cancel / release)
-    quit / exit → Close the CLI
+    F3,R90,F5   => Sends  T:F3,R90,F5,S  (auto-appends S if missing)
+    r           => Repeat the last track command
+    home        => Reset odometry origin to current position (x=0, y=0, heading=0)
+    returnhome  => Navigate autonomously back to home coordinates (0, 0)
+    pos         => Print current X / Y / heading once
+    debug       => Toggle live X / Y / heading stream (every 200 ms)
+    1 / 15 / 0  => Sends the numeric command as-is
+    m / s / p   => Sends the single-char Teensy command
+    x           => CAN lock/latch toggle (physical robot stop + track cancel / release)
+    quit / exit => Close the CLI
 """
 
 import sys
@@ -25,6 +31,8 @@ import re
 import threading
 import time
 import subprocess
+import locale
+import os
 
 
 try:
@@ -33,8 +41,29 @@ except ImportError:
     print("ERROR: pyserial is not installed. Run:  pip install pyserial")
     sys.exit(1)
 
-# ─── Serial reader thread ──────────────────────────────────────
 
+# ---- Configure UTF-8 for Jetson environment ----
+def setup_utf8_locale():
+    """Ensure UTF-8 locale for proper character encoding."""
+    try:
+        # Try to set UTF-8 locale
+        locale.setlocale(locale.LC_ALL, "C.UTF-8")
+    except locale.Error:
+        try:
+            locale.setlocale(locale.LC_ALL, "en_US.UTF-8")
+        except locale.Error:
+            # Fallback - use C locale
+            locale.setlocale(locale.LC_ALL, "C")
+
+    # Set environment variable for subprocess calls
+    if "UTF" not in os.environ.get("LANG", "").upper():
+        os.environ["LANG"] = "C.UTF-8"
+
+
+setup_utf8_locale()
+
+
+# ---- Serial reader thread ----
 
 def reader_thread(ser: serial.Serial, stop_event: threading.Event):
     """Continuously read and print serial output from the Teensy."""
@@ -43,14 +72,14 @@ def reader_thread(ser: serial.Serial, stop_event: threading.Event):
             if ser.in_waiting:
                 line = ser.readline().decode("utf-8", errors="replace").rstrip()
                 if line:
-                    print(f"  ← {line}")
+                    print("  <- " + line)
             else:
                 time.sleep(0.01)
         except (serial.SerialException, OSError):
             break
 
 
-# ─── Helpers ────────────────────────────────────────────────────
+# ---- Helpers ----
 
 # Matches drive-command tokens: F3, B1.5, L90, R45, S  (case insensitive)
 TASK_TOKEN_RE = re.compile(r"^[FBLRSfblrs]", re.IGNORECASE)
@@ -86,26 +115,25 @@ def frame_task(text: str) -> str:
     return "T:" + ",".join(tokens)
 
 
-# ─── Main REPL ─────────────────────────────────────────────────
-
+# ---- Main REPL ----
 
 def find_serial_port(baud: int) -> serial.Serial:
     """Try /dev/ttyACM1 then /dev/ttyACM2. Block until one connects."""
     candidates = ["/dev/ttyACM1", "/dev/ttyACM2"]
 
-    print("roboCLI  searching for Teensy...")
+    print("roboCLI searching for Teensy...")
 
     while True:
         for port in candidates:
             try:
                 ser = serial.Serial(port, baud, timeout=0.1)
-                print(f"  ✓ Connected on {port}")
+                print("  [OK] Connected on " + port)
                 return ser
             except (serial.SerialException, OSError):
                 pass
 
-        # Neither found — wait and retry
-        print(f"  ✗ No device on {candidates[0]} or {candidates[1]} — retrying in 2s")
+        # Neither found -- wait and retry
+        print("  [FAIL] No device on " + candidates[0] + " or " + candidates[1] + " -- retrying in 2s")
         time.sleep(2)
 
 
@@ -114,7 +142,7 @@ def main():
 
     ser = find_serial_port(baud)
 
-    print(f"Ready @ {baud} baud.  Type commands or 'quit' to exit.\n")
+    print("Ready @ " + str(baud) + " baud.  Type commands or 'quit' to exit.\n")
 
     # Start background reader
     stop_event = threading.Event()
@@ -122,6 +150,8 @@ def main():
     reader.start()
 
     robot_locked = False
+    last_track: str | None = None  # last successfully sent drive task
+    debug_on = False               # tracks whether live odometry stream is active
 
     try:
         while True:
@@ -135,11 +165,11 @@ def main():
 
             lower = user_input.lower()
 
-            # ── Quit ──
+            # ---- Quit ----
             if lower in ("quit", "exit"):
                 break
 
-            # ── CAN Lock Toggle ──
+            # ---- CAN Lock Toggle ----
             if lower == "x":
                 if not robot_locked:
                     print("  [LOCK] Running CAN lock command in background...")
@@ -150,7 +180,7 @@ def main():
                             stderr=subprocess.DEVNULL
                         )
                     except Exception as e:
-                        print(f"  Error spawning CAN lock command: {e}")
+                        print("  Error spawning CAN lock command: " + str(e))
 
                     # Cancel any running autonomous track, then stop manual motors
                     ser.write(b"T:S\n")   # abort drive task queue on Teensy
@@ -166,36 +196,91 @@ def main():
                             stderr=subprocess.DEVNULL
                         )
                     except Exception as e:
-                        print(f"  Error spawning CAN latch command: {e}")
+                        print("  Error spawning CAN latch command: " + str(e))
 
                     robot_locked = False
                 continue
 
-            # ── Single-char Teensy commands ──
+            # ---- Single-char Teensy commands ----
             if lower in ("m", "s", "p"):
-                ser.write((lower + "\n").encode())
-                print(f"  → {lower}")
+                ser.write((lower + "\n").encode("utf-8"))
+                print("  -> " + lower)
                 continue
 
-            # ── Task command (drive sequence) ──
+            # ---- Set home ----
+            if lower == "home":
+                if robot_locked:
+                    print("  ! EMERGENCY LATCHED -- home command blocked. Unlock with x first.")
+                else:
+                    ser.write(b"home\n")
+                    print("  -> home")
+                continue
+
+            # ---- Return to home coordinates via navigation ----
+            if lower == "returnhome":
+                if robot_locked:
+                    print("  ! EMERGENCY LATCHED -- returnhome blocked. Unlock with x first.")
+                else:
+                    # Pause live debug stream so navigation messages are readable
+                    if debug_on:
+                        ser.write(b"d\n")
+                        debug_on = False
+                        print("  [debug stream paused for navigation]")
+                    ser.write(b"returnhome\n")
+                    print("  -> returnhome  (navigating to 0, 0)")
+                continue
+
+            # ---- One-shot position snapshot ----
+            if lower == "pos":
+                ser.write(b"pos\n")
+                print("  -> pos")
+                continue
+
+            # ---- Toggle live odometry debug stream ----
+            if lower == "debug":
+                if robot_locked:
+                    print("  ! EMERGENCY LATCHED -- debug blocked. Unlock with x first.")
+                else:
+                    ser.write(b"d\n")
+                    debug_on = not debug_on
+                    status = "ON" if debug_on else "OFF"
+                    print("  -> d  (live odometry stream " + status + ")")
+                continue
+
+            # ---- Repeat last track ----
+            if lower == "r":
+                if last_track is None:
+                    print("  ! No previous track to repeat")
+                elif robot_locked:
+                    print("  ! EMERGENCY LATCHED -- track discarded. Unlock with x first.")
+                else:
+                    ser.write((last_track + "\n").encode("utf-8"))
+                    print("  -> (repeat) " + last_track)
+                continue
+
+            # ---- Task command (drive sequence) ----
             if is_task_input(user_input):
+                if robot_locked:
+                    print("  ! EMERGENCY LATCHED -- track discarded. Unlock with x first.")
+                    continue
                 framed = frame_task(user_input)
-                ser.write((framed + "\n").encode())
-                print(f"  → {framed}")
+                ser.write((framed + "\n").encode("utf-8"))
+                print("  -> " + framed)
+                last_track = framed
                 continue
 
-            # ── Numeric motion command ──
+            # ---- Numeric motion command ----
             try:
                 int(user_input)
-                ser.write((user_input + "\n").encode())
-                print(f"  → {user_input}")
+                ser.write((user_input + "\n").encode("utf-8"))
+                print("  -> " + user_input)
                 continue
             except ValueError:
                 pass
 
-            # ── Unknown ──
-            print(f"  ? Unknown command: '{user_input}'")
-            print("    Hint: F3,R90,F5 | 1 | 0 | m | s | p | x | quit")
+            # ---- Unknown ----
+            print("  ? Unknown command: '" + user_input + "'")
+            print("    Hint: F3,R90,F5 | r | home | returnhome | pos | debug | 1 | 0 | m | s | p | x | quit")
 
     except KeyboardInterrupt:
         print("\nInterrupted.")

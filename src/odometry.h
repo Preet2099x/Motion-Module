@@ -2,9 +2,13 @@
 
 struct OdometryData
 {
-    float x;         // metres
-    float y;         // metres
-    float heading;   // radians
+    float x;
+    float y;
+    float heading;
+
+    float homeX;
+    float homeY;
+    float homeHeading;
 };
 
 extern OdometryData odometry;
@@ -12,3 +16,4 @@ extern OdometryData odometry;
 void Odometry_Init();
 void Odometry_Reset();
 void Odometry_Update();
+void Odometry_SetHome();

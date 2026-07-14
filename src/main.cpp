@@ -231,6 +231,13 @@ void loop()
       {
         printAlter = !printAlter;
       }
+
+      else if (fullLine.equalsIgnoreCase("home"))
+      {
+        Odometry_SetHome();
+        data = 0;
+      }
+
       // ── Numeric motion command ──
       else if (fullLine.length() >= 1 && fullLine.charAt(0) != '\n')
       {
@@ -440,8 +447,8 @@ void loop()
     {
       bnoPrintTimer = millis();
 
-      // Serial.print(data);
-      // Serial.print(" | ");
+      Serial.print(data);
+      Serial.print(" | ");
 
       // Serial.print(" | Dist=");
       // Serial.print(distance.travelled, 3);
@@ -462,14 +469,14 @@ void loop()
 
       // Serial.println(" rad/s");
 
-      // Serial.print(" | X=");
-      // Serial.print(odometry.x, 3);
+      Serial.print(" | X=");
+      Serial.print(odometry.x, 3);
 
-      // Serial.print(" | Y=");
-      // Serial.print(odometry.y, 3);
+      Serial.print(" | Y=");
+      Serial.print(odometry.y, 3);
 
-      // Serial.print(" | H=");
-      // Serial.print(odometry.heading, 3);
+      Serial.print(" | H=");
+      Serial.print(odometry.heading, 3);
 
       // Serial.println(" rad");
 

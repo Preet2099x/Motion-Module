@@ -9,6 +9,7 @@
 OdometryData odometry;
 
 static float previousDistance = 0.0f;
+static float headingOffset = 0.0f;
 
 void Odometry_Init()
 {
@@ -21,14 +22,27 @@ void Odometry_Reset()
     odometry.y = 0.0f;
     odometry.heading = 0.0f;
 
+    odometry.homeX = 0.0f;
+    odometry.homeY = 0.0f;
+    odometry.homeHeading = 0.0f;
+
     previousDistance = distance.travelled;
+    headingOffset = currentHeading;
 }
 
 void Odometry_Update()
 {
     float deltaDistance = distance.travelled - previousDistance;
 
-    float headingRad = currentHeading * PI / 180.0f;
+    float headingDeg = currentHeading - headingOffset;
+
+    while (headingDeg > 180.0f)
+        headingDeg -= 360.0f;
+
+    while (headingDeg < -180.0f)
+        headingDeg += 360.0f;
+
+    float headingRad = headingDeg * PI / 180.0f;
 
     odometry.x += deltaDistance * cosf(headingRad);
     odometry.y += deltaDistance * sinf(headingRad);
@@ -36,4 +50,20 @@ void Odometry_Update()
     odometry.heading = headingRad;
 
     previousDistance = distance.travelled;
+}
+
+void Odometry_SetHome()
+{
+    odometry.x = 0.0f;
+    odometry.y = 0.0f;
+    odometry.heading = 0.0f;
+
+    odometry.homeX = 0.0f;
+    odometry.homeY = 0.0f;
+    odometry.homeHeading = 0.0f;
+
+    previousDistance = distance.travelled;
+    headingOffset = currentHeading;
+
+    Serial.println("ODOMETRY: Home set (x=0, y=0, heading=0)");
 }
