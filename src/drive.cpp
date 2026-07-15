@@ -1,5 +1,6 @@
 #include "drive.h"
 #include "distance.h"
+#include "navigation.h"
 #include <var.h>
 
 // ─── Internal state ────────────────────────────────────
@@ -26,8 +27,9 @@ static float startHeading = 0.0f;
 
 // ─── Tuning ────────────────────────────────────────────
 
-static const float TURN_TOLERANCE = 2.0f;  // degrees — stop within this of target
-static const float TURN_SLOW_ZONE = 20.0f; // degrees — slow down when this close
+static const float TURN_TOLERANCE = 3.0f;  // degrees — stop within this of target
+static const float TURN_CRAWL_ZONE = 8.0f; // degrees — use crawl speed in this zone
+static const float TURN_SLOW_ZONE  = 25.0f; // degrees — use slow speed in this zone
 
 // ─── Helpers ───────────────────────────────────────────
 
@@ -305,9 +307,13 @@ void Drive_Update()
             Serial.println(")");
             advanceQueue();
         }
+        else if (remaining <= TURN_CRAWL_ZONE)
+        {
+            motion(21); // crawl — slowest left turn
+        }
         else if (remaining <= TURN_SLOW_ZONE)
         {
-            motion(21); // slowest left turn
+            motion(23); // slow left turn
         }
         else
         {
@@ -342,9 +348,13 @@ void Drive_Update()
             Serial.println(")");
             advanceQueue();
         }
+        else if (remaining <= TURN_CRAWL_ZONE)
+        {
+            motion(11); // crawl — slowest right turn
+        }
         else if (remaining <= TURN_SLOW_ZONE)
         {
-            motion(11); // slowest right turn
+            motion(13); // slow right turn
         }
         else
         {
@@ -358,11 +368,13 @@ void Drive_Update()
     {
         motion(0);
         Serial.println("DRIVE: Stop");
-        // Stop ends the task entirely
+        // Stop ends the task entirely — also cancel any running navigation
+        // so that after an emergency unlatch the robot stays idle.
         queueLength = 0;
         queueIndex = 0;
         state = DRIVE_IDLE;
         resetCommandState();
+        Navigation_Cancel();
         break;
     }
     }

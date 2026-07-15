@@ -12,6 +12,7 @@ enum NavigationState
 };
 
 static NavigationState state = NAV_IDLE;
+static bool commandSent = false;
 
 void Navigation_Init()
 {
@@ -45,13 +46,25 @@ void Navigation_Update()
 
     if (state == NAV_RETURN_HOME)
     {
+        // Wait until the previous drive command finishes
+        if (Drive_IsRunning())
+            return;
+
         float dx = -odometry.x;
         float dy = -odometry.y;
 
         float distance = sqrtf(dx * dx + dy * dy);
 
-        float targetHeading = atan2f(dy, dx);
+        // Already at home?
+        if (distance < 0.10f)
+        {
+            Serial.println("NAVIGATION: Home reached");
+            state = NAV_IDLE;
+            commandSent = false;
+            return;
+        }
 
+        float targetHeading = atan2f(dy, dx);
         float headingError = targetHeading - odometry.heading;
 
         while (headingError > PI)
@@ -60,18 +73,26 @@ void Navigation_Update()
         while (headingError < -PI)
             headingError += 2.0f * PI;
 
-        Serial.print("NAV: Dist=");
-        Serial.print(distance, 3);
+        // If we're already facing home (within 3° leeway), don't issue another turn.
+        if (fabsf(headingError) < (3.0f * PI / 180.0f))
+        {
+            Serial.println("NAVIGATION: Facing home");
+            return;
+        }
 
-        Serial.print(" Target=");
-        Serial.print(targetHeading * 180.0f / PI, 1);
+        DriveCommand cmd;
 
-        Serial.print(" Heading=");
-        Serial.print(odometry.heading * 180.0f / PI, 1);
+        if (headingError > 0)
+            cmd.type = CMD_LEFT;
+        else
+            cmd.type = CMD_RIGHT;
 
-        Serial.print(" Error=");
-        Serial.println(headingError * 180.0f / PI, 1);
+        cmd.value = fabsf(headingError) * 180.0f / PI;
 
-        state = NAV_IDLE;
+        Drive_SubmitTask(&cmd, 1);
+
+        Serial.print("NAVIGATION: Turn ");
+        Serial.print(cmd.value, 1);
+        Serial.println(" deg");
     }
 }

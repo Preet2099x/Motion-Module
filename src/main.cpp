@@ -239,6 +239,11 @@ void loop()
         Odometry_SetHome();
         data = 0;
       }
+      else if (fullLine.equalsIgnoreCase("returnhome"))
+      {
+        Navigation_ReturnHome();
+        data = 0;
+      }
 
       // ── Numeric motion command ──
       else if (fullLine.length() >= 1 && fullLine.charAt(0) != '\n')
@@ -289,6 +294,7 @@ void loop()
     if (emergencyAlter)
     {
       Drive_Cancel();
+      Navigation_Cancel();
       emergencyAlter = false;
     }
   }
@@ -443,6 +449,7 @@ void loop()
     encoderValue_L = encoderValue_R = 0;
 
     Navigation_Update();
+    Drive_Update();
 
     // Print debug at 200ms to avoid serial flooding
     static unsigned long bnoPrintTimer = 0;
