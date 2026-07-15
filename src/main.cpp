@@ -469,6 +469,12 @@ void loop()
 
       // Serial.println(" rad/s");
 
+      Serial.print(" D=");
+      Serial.print(distance.travelled, 3);
+
+      Serial.print(" OD=");
+      Serial.print(distance.odometryTravelled, 3);
+      
       Serial.print(" | X=");
       Serial.print(odometry.x, 3);
 
@@ -476,7 +482,7 @@ void loop()
       Serial.print(odometry.y, 3);
 
       Serial.print(" | H=");
-      Serial.print(odometry.heading, 3);
+      Serial.println(odometry.heading, 3);
 
       // Serial.println(" rad");
 

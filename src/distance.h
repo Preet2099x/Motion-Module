@@ -2,9 +2,10 @@
 
 struct DistanceData
 {
-    float left;       // meters
-    float right;      // meters
-    float travelled;  // meters
+    float left;                 // Total left wheel distance
+    float right;                // Total right wheel distance
+    float travelled;            // Always positive (used by Drive)
+    float odometryTravelled;    // Signed (used only by Odometry)
 };
 
 extern DistanceData distance;

@@ -32,7 +32,7 @@ void Odometry_Reset()
 
 void Odometry_Update()
 {
-    float deltaDistance = distance.travelled - previousDistance;
+    float deltaDistance = distance.odometryTravelled - previousDistance;
 
     float headingDeg = currentHeading - headingOffset;
 
@@ -49,7 +49,7 @@ void Odometry_Update()
 
     odometry.heading = headingRad;
 
-    previousDistance = distance.travelled;
+    previousDistance = distance.odometryTravelled;
 }
 
 void Odometry_SetHome()
