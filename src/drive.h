@@ -19,9 +19,13 @@ struct DriveCommand
 };
 
 // ─── Public API ────────────────────────────────────────
+
 void Drive_Init();
 void Drive_Update();
+
 void Drive_ParseTask(const String &raw);
+bool Drive_SubmitTask(const DriveCommand *commands, int count);
+
 bool Drive_IsRunning();
-void Drive_Cancel(); // Abort the current task and reset the queue
+void Drive_Cancel();
 

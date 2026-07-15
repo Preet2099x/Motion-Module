@@ -62,7 +62,7 @@ void Odometry_SetHome()
     odometry.homeY = 0.0f;
     odometry.homeHeading = 0.0f;
 
-    previousDistance = distance.travelled;
+    previousDistance = distance.odometryTravelled;
     headingOffset = currentHeading;
 
     Serial.println("ODOMETRY: Home set (x=0, y=0, heading=0)");

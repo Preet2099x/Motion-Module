@@ -24,12 +24,10 @@ static bool commandStarted = false;
 static float startDistance = 0.0f;
 static float startHeading = 0.0f;
 
-
-
 // ─── Tuning ────────────────────────────────────────────
 
-static const float TURN_TOLERANCE  = 2.0f;   // degrees — stop within this of target
-static const float TURN_SLOW_ZONE  = 20.0f;  // degrees — slow down when this close
+static const float TURN_TOLERANCE = 2.0f;  // degrees — stop within this of target
+static const float TURN_SLOW_ZONE = 20.0f; // degrees — slow down when this close
 
 // ─── Helpers ───────────────────────────────────────────
 
@@ -87,11 +85,38 @@ void Drive_Cancel()
     {
         motion(0); // Ensure motors are stopped
         queueLength = 0;
-        queueIndex  = 0;
-        state       = DRIVE_IDLE;
+        queueIndex = 0;
+        state = DRIVE_IDLE;
         resetCommandState();
         Serial.println("DRIVE: Task cancelled (emergency)");
     }
+}
+
+bool Drive_SubmitTask(const DriveCommand *commands, int count)
+{
+    if (state == DRIVE_RUNNING)
+        return false;
+
+    if (count <= 0)
+        return false;
+
+    if (count > QUEUE_MAX)
+        count = QUEUE_MAX;
+
+    queueLength = count;
+    queueIndex = 0;
+    state = DRIVE_RUNNING;
+
+    resetCommandState();
+
+    for (int i = 0; i < count; i++)
+        queue[i] = commands[i];
+
+    Serial.print("DRIVE: Queued ");
+    Serial.print(queueLength);
+    Serial.println(" command(s)");
+
+    return true;
 }
 
 // ─── Parse ─────────────────────────────────────────────
@@ -174,10 +199,7 @@ void Drive_ParseTask(const String &raw)
 
     if (queueLength > 0)
     {
-        state = DRIVE_RUNNING;
-        Serial.print("DRIVE: Queued ");
-        Serial.print(queueLength);
-        Serial.println(" command(s)");
+        Drive_SubmitTask(queue, queueLength);
     }
     else
     {

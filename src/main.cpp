@@ -11,6 +11,7 @@
 #include "velocity.h"
 #include "odometry.h"
 #include "drive.h"
+#include "navigation.h"
 
 int SLAVE_ADDRESS = 0x72;
 
@@ -158,6 +159,7 @@ void setup()
   Velocity_Init();
   Odometry_Init();
   Drive_Init();
+  Navigation_Init();
 
   Serial5.write(0);
   Serial5.write(192);
@@ -440,6 +442,8 @@ void loop()
 
     encoderValue_L = encoderValue_R = 0;
 
+    Navigation_Update();
+
     // Print debug at 200ms to avoid serial flooding
     static unsigned long bnoPrintTimer = 0;
 
@@ -469,12 +473,12 @@ void loop()
 
       // Serial.println(" rad/s");
 
-      Serial.print(" D=");
-      Serial.print(distance.travelled, 3);
+      // Serial.print(" D=");
+      // Serial.print(distance.travelled, 3);
 
-      Serial.print(" OD=");
-      Serial.print(distance.odometryTravelled, 3);
-      
+      // Serial.print(" OD=");
+      // Serial.print(distance.odometryTravelled, 3);
+
       Serial.print(" | X=");
       Serial.print(odometry.x, 3);
 
