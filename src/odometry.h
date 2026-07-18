@@ -4,7 +4,9 @@ struct OdometryData
 {
     float x;
     float y;
-    float heading;
+
+    float heading;      // relative heading (0 after Home)
+    float rawHeading;   // raw BNO heading (0-360)
 
     float homeX;
     float homeY;

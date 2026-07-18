@@ -480,11 +480,11 @@ void loop()
 
       // Serial.println(" rad/s");
 
-      // Serial.print(" D=");
-      // Serial.print(distance.travelled, 3);
+      Serial.print(" D=");
+      Serial.print(distance.travelled, 3);
 
-      // Serial.print(" OD=");
-      // Serial.print(distance.odometryTravelled, 3);
+      Serial.print(" OD=");
+      Serial.print(distance.odometryTravelled, 3);
 
       Serial.print(" | X=");
       Serial.print(odometry.x, 3);
@@ -493,21 +493,22 @@ void loop()
       Serial.print(odometry.y, 3);
 
       Serial.print(" | H=");
-      Serial.println(odometry.heading, 3);
+      Serial.print(odometry.heading, 3);
+      
 
       // Serial.println(" rad");
 
-      // Serial.print(" Heading=");
-      // Serial.print(currentHeading);
+      Serial.print(" Heading=");
+      Serial.print(currentHeading);
 
-      // Serial.print(" | Target=");
-      // Serial.print(targetHeading);
+      Serial.print(" | Target=");
+      Serial.print(targetHeading);
 
-      // Serial.print(" | Error=");
-      // Serial.print(pidError);
+      Serial.print(" | Error=");
+      Serial.print(pidError);
 
-      // Serial.print(" | Corr=");
-      // Serial.print(pidCorrection);
+      Serial.print(" | Corr=");
+      Serial.print(pidCorrection);
 
       // Serial.print(" | L=");
       // Serial.print(debugPwmL);
@@ -515,8 +516,8 @@ void loop()
       // Serial.print(" | R=");
       // Serial.print(debugPwmR);
 
-      // Serial.print(" | I=");
-      // Serial.println(headingIntegral);
+      Serial.print(" | I=");
+      Serial.println(headingIntegral);
     }
   }
 

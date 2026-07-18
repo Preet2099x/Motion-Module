@@ -9,7 +9,8 @@ enum DriveCommandType
     CMD_BACKWARD,
     CMD_LEFT,
     CMD_RIGHT,
-    CMD_STOP
+    CMD_STOP,
+    CMD_TURN_TO_ABS  // value = absolute target heading in odometry space (0–360 deg)
 };
 
 struct DriveCommand

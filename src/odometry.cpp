@@ -34,20 +34,22 @@ void Odometry_Update()
 {
     float deltaDistance = distance.odometryTravelled - previousDistance;
 
-    float headingDeg = currentHeading - headingOffset;
+    // Raw BNO heading (never changes)
+    odometry.rawHeading = currentHeading;
 
-    while (headingDeg > 180.0f)
-        headingDeg -= 360.0f;
+    // Relative heading (0 after Home)
+    odometry.heading = currentHeading - headingOffset;
 
-    while (headingDeg < -180.0f)
-        headingDeg += 360.0f;
+    while (odometry.heading >= 360.0f)
+        odometry.heading -= 360.0f;
 
-    float headingRad = headingDeg * PI / 180.0f;
+    while (odometry.heading < 0.0f)
+        odometry.heading += 360.0f;
+
+    float headingRad = odometry.heading * PI / 180.0f;
 
     odometry.x += deltaDistance * cosf(headingRad);
     odometry.y += deltaDistance * sinf(headingRad);
-
-    odometry.heading = headingRad;
 
     previousDistance = distance.odometryTravelled;
 }

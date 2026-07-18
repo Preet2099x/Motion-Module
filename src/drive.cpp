@@ -1,6 +1,7 @@
 #include "drive.h"
 #include "distance.h"
 #include "navigation.h"
+#include "odometry.h"
 #include <var.h>
 
 // ─── Internal state ────────────────────────────────────
@@ -24,6 +25,7 @@ static DriveState state = DRIVE_IDLE;
 static bool commandStarted = false;
 static float startDistance = 0.0f;
 static float startHeading = 0.0f;
+static float plannedTurnDelta = 0.0f; // used by CMD_TURN_TO_ABS
 
 // ─── Tuning ────────────────────────────────────────────
 
@@ -49,6 +51,7 @@ static void resetCommandState()
     commandStarted = false;
     startDistance = 0.0f;
     startHeading = 0.0f;
+    plannedTurnDelta = 0.0f;
 }
 
 // Advance to the next queued command
@@ -117,6 +120,7 @@ bool Drive_SubmitTask(const DriveCommand *commands, int count)
     Serial.print("DRIVE: Queued ");
     Serial.print(queueLength);
     Serial.println(" command(s)");
+    
 
     return true;
 }
@@ -282,9 +286,7 @@ void Drive_Update()
     }
 
     // ── LEFT TURN ────────────────────────────────────
-    // On this robot, motion(11-20) causes BNO heading to increase.
-    // delta = normalizeAngle(currentHeading - startHeading)
-    // Positive delta = heading increased = turned left.
+    
     case CMD_LEFT:
     {
         if (!commandStarted)
@@ -295,8 +297,8 @@ void Drive_Update()
             Serial.print(cmd.value);
             Serial.println(" deg");
         }
-
-        float delta = normalizeAngle(startHeading - currentHeading);
+        
+        float delta = normalizeAngle(currentHeading - startHeading);
         float remaining = cmd.value - delta;
 
         if (remaining <= TURN_TOLERANCE)
@@ -323,9 +325,7 @@ void Drive_Update()
     }
 
     // ── RIGHT TURN ───────────────────────────────────
-    // On this robot, motion(21-30) causes BNO heading to decrease.
-    // delta = normalizeAngle(startHeading - currentHeading)
-    // Positive delta = heading decreased = turned right.
+
     case CMD_RIGHT:
     {
         if (!commandStarted)
@@ -359,6 +359,49 @@ void Drive_Update()
         else
         {
             motion(15); // mid-range right turn
+        }
+        break;
+    }
+
+    // ── TURN TO ABSOLUTE HEADING ─────────────────────
+    case CMD_TURN_TO_ABS:
+    {
+        if (!commandStarted)
+        {
+            // Compute signed delta in odometry space once, at execution time
+            plannedTurnDelta = normalizeAngle(cmd.value - odometry.heading);
+            commandStarted = true;
+            Serial.print("DRIVE: TurnToAbs ");
+            Serial.print(cmd.value, 1);
+            Serial.print(" deg (delta=");
+            Serial.print(plannedTurnDelta, 1);
+            Serial.println(")");
+        }
+
+        // Track progress: positive delta = right, negative = left
+        float current = normalizeAngle(odometry.heading - (cmd.value - plannedTurnDelta));
+        float remaining = plannedTurnDelta - current;
+
+        if (fabs(remaining) <= TURN_TOLERANCE)
+        {
+            motion(0);
+            Serial.print("DRIVE: TurnToAbs done (remaining=");
+            Serial.print(remaining, 1);
+            Serial.println(")");
+            advanceQueue();
+        }
+        else if (remaining > 0) // need to turn right
+        {
+            if (remaining <= TURN_CRAWL_ZONE)      motion(11);
+            else if (remaining <= TURN_SLOW_ZONE)  motion(13);
+            else                                    motion(15);
+        }
+        else // need to turn left
+        {
+            float absRem = -remaining;
+            if (absRem <= TURN_CRAWL_ZONE)         motion(21);
+            else if (absRem <= TURN_SLOW_ZONE)     motion(23);
+            else                                   motion(25);
         }
         break;
     }
