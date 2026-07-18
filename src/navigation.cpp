@@ -10,7 +10,8 @@
 enum NavigationState
 {
     NAV_IDLE,
-    NAV_WAIT  // Drive is executing the submitted batch; we just wait
+    NAV_WAIT_SEGMENT_1,
+    NAV_WAIT_SEGMENT_2
 };
 
 static NavigationState state = NAV_IDLE;
@@ -66,7 +67,7 @@ void Navigation_ReturnHome()
     float dy = -odometry.y;
     float dist = sqrtf(dx * dx + dy * dy);
 
-    if (dist < 0.10f)
+    if (dist < 0.05f)
     {
         Serial.println("NAVIGATION: Already at home");
         return;
@@ -74,25 +75,21 @@ void Navigation_ReturnHome()
 
     float targetHeading = calculateHeadingToHome();
 
-    // Build the full command sequence and submit it in one shot.
-    // CMD_TURN_TO_ABS values are resolved against odometry.heading at
-    // execution time, so the return-to-0 turn is always correct even
-    // after drive drift.
-    DriveCommand cmds[3];
-
+    DriveCommand cmds[2];
     cmds[0].type  = CMD_TURN_TO_ABS;
     cmds[0].value = targetHeading; // face home
 
     cmds[1].type  = CMD_FORWARD;
-    cmds[1].value = dist;          // drive home
+    if (dist > 0.5f) {
+        cmds[1].value = 0.5f;   // drive 0.5m segment
+    } else {
+        cmds[1].value = dist;   // drive remaining distance
+    }
 
-    cmds[2].type  = CMD_TURN_TO_ABS;
-    cmds[2].value = 0.0f;          // restore start heading
-
-    if (Drive_SubmitTask(cmds, 3))
+    if (Drive_SubmitTask(cmds, 2))
     {
-        Serial.println("NAVIGATION: Returning home");
-        state = NAV_WAIT;
+        Serial.println("NAVIGATION: Returning home (Segment 1)");
+        state = NAV_WAIT_SEGMENT_1;
     }
 }
 
@@ -101,10 +98,60 @@ void Navigation_Update()
     if (state == NAV_IDLE)
         return;
 
-    // NAV_WAIT: nothing to do but watch for completion
     if (!Drive_IsRunning())
     {
-        Serial.println("NAVIGATION: Home reached");
-        state = NAV_IDLE;
+        if (state == NAV_WAIT_SEGMENT_1)
+        {
+            float dx = -odometry.x;
+            float dy = -odometry.y;
+            float dist = sqrtf(dx * dx + dy * dy);
+            
+            if (dist > 0.05f)
+            {
+                float targetHeading = calculateHeadingToHome();
+                
+                DriveCommand cmds[2];
+                cmds[0].type  = CMD_TURN_TO_ABS;
+                cmds[0].value = targetHeading; // face home again
+                
+                cmds[1].type  = CMD_FORWARD;
+                if (dist > 0.5f) {
+                    cmds[1].value = 0.5f;
+                } else {
+                    cmds[1].value = dist;
+                }
+
+                if (Drive_SubmitTask(cmds, 2))
+                {
+                    Serial.println("NAVIGATION: Returning home (Next Segment)");
+                    state = NAV_WAIT_SEGMENT_1; // Loop in this state
+                }
+                else
+                {
+                    state = NAV_IDLE;
+                }
+            }
+            else // Reached home, now align
+            {
+                DriveCommand cmds[1];
+                cmds[0].type  = CMD_TURN_TO_ABS;
+                cmds[0].value = 0.0f;          // align to zero
+
+                if (Drive_SubmitTask(cmds, 1))
+                {
+                    Serial.println("NAVIGATION: Home reached, aligning");
+                    state = NAV_WAIT_SEGMENT_2;
+                }
+                else
+                {
+                    state = NAV_IDLE;
+                }
+            }
+        }
+        else if (state == NAV_WAIT_SEGMENT_2)
+        {
+            Serial.println("NAVIGATION: Return home complete");
+            state = NAV_IDLE;
+        }
     }
 }
