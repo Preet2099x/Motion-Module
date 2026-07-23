@@ -29,9 +29,9 @@ static float plannedTurnDelta = 0.0f; // used by CMD_TURN_TO_ABS
 
 // ─── Tuning ────────────────────────────────────────────
 
-static const float TURN_TOLERANCE = 3.0f;  // degrees — stop within this of target
-static const float TURN_CRAWL_ZONE = 8.0f; // degrees — use crawl speed in this zone
-static const float TURN_SLOW_ZONE  = 25.0f; // degrees — use slow speed in this zone
+static const float TURN_TOLERANCE = 1.0f;  // degrees — stop within this of target (extreme precision)
+static const float TURN_CRAWL_ZONE = 5.0f; // degrees — use crawl speed in this zone
+static const float TURN_SLOW_ZONE  = 15.0f; // degrees — use slow speed in this zone
 
 // ─── Helpers ───────────────────────────────────────────
 

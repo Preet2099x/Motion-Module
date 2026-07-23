@@ -271,7 +271,7 @@ void loop()
   // Control-counter timeout: only when NOT in autonomous drive
   if (elaspedTimeControlCounter > timeConstantControlCounter)
   {
-    if (!Drive_IsRunning())
+    if (!Drive_IsRunning() && !Navigation_IsRunning())
     {
       data = 0; // Commenting for Testing //TODO:
     }
@@ -302,10 +302,12 @@ void loop()
   {
     emergencyAlter = true; // Rearm for the next latch event
 
-    // ── Autonomous drive mode: only Drive_Update() calls motion() ──
-    if (Drive_IsRunning())
+    // ── Autonomous mode: suppress manual control ──
+    // Navigation_IsRunning() covers pursuit/parking (navigation calls motion()
+    // directly).  Drive_IsRunning() covers queued commands (drive calls motion()).
+    if (Drive_IsRunning() || Navigation_IsRunning())
     {
-      // Manual data is ignored while a task is executing
+      // Manual data is ignored while an autonomous task is executing
       data = 0;
     }
     // ── Normal manual control ──
