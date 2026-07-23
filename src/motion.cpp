@@ -100,7 +100,7 @@ float normalizeHeadingError(float error)
 void motion(int _data)
 {
 
-  if (_data == 65)
+  if (_data == 66)
   {
     if (millis() - boostCommandTimer >= 500)
     {
@@ -116,7 +116,7 @@ void motion(int _data)
     return;
   }
 
-  if (_data == 66)
+  if (_data == 65)
   {
     if (millis() - boostCommandTimer >= 500)
     {

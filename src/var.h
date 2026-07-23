@@ -12,7 +12,29 @@ extern float pidError;
 extern float pidCorrection;
 extern float targetHeading;
 extern float headingIntegral;
+
+extern float imuRoll;
+extern float imuPitch;
+
+extern float imuGx;
+extern float imuGy;
+extern float imuGz;
+
+extern float imuAx;
+extern float imuAy;
+extern float imuAz;
+
+extern float imuQw;
+extern float imuQx;
+extern float imuQy;
+extern float imuQz;
+
+extern float imuLiaX;
+extern float imuLiaY;
+extern float imuLiaZ;
+
 //---------------------
+
 extern int pwmPin_L;
 extern int dirPin_L;
 

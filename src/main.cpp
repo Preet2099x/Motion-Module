@@ -458,8 +458,8 @@ void loop()
     {
       bnoPrintTimer = millis();
 
-      Serial.print(data);
-      Serial.print(" | ");
+      // Serial.print(data);
+      // Serial.print(" | ");
 
       // Serial.print(" | Dist=");
       // Serial.print(distance.travelled, 3);
@@ -480,44 +480,44 @@ void loop()
 
       // Serial.println(" rad/s");
 
-      Serial.print(" D=");
-      Serial.print(distance.travelled, 3);
+      // Serial.print(" D=");
+      // Serial.print(distance.travelled, 3);
 
-      Serial.print(" OD=");
-      Serial.print(distance.odometryTravelled, 3);
+      // Serial.print(" OD=");
+      // Serial.print(distance.odometryTravelled, 3);
 
-      Serial.print(" | X=");
-      Serial.print(odometry.x, 3);
+      // Serial.print(" | X=");
+      // Serial.print(odometry.x, 3);
 
-      Serial.print(" | Y=");
-      Serial.print(odometry.y, 3);
+      // Serial.print(" | Y=");
+      // Serial.print(odometry.y, 3);
 
-      Serial.print(" | H=");
-      Serial.print(odometry.heading, 3);
+      // Serial.print(" | H=");
+      // Serial.print(odometry.heading, 3);
       
 
       // Serial.println(" rad");
 
-      Serial.print(" Heading=");
-      Serial.print(currentHeading);
+      // Serial.print(" Heading=");
+      // Serial.print(currentHeading);
 
-      Serial.print(" | Target=");
-      Serial.print(targetHeading);
+      // Serial.print(" | Target=");
+      // Serial.print(targetHeading);
 
-      Serial.print(" | Error=");
-      Serial.print(pidError);
+      // Serial.print(" | Error=");
+      // Serial.print(pidError);
 
-      Serial.print(" | Corr=");
-      Serial.print(pidCorrection);
+      // Serial.print(" | Corr=");
+      // Serial.print(pidCorrection);
 
-      // Serial.print(" | L=");
-      // Serial.print(debugPwmL);
+      // // Serial.print(" | L=");
+      // // Serial.print(debugPwmL);
 
-      // Serial.print(" | R=");
-      // Serial.print(debugPwmR);
+      // // Serial.print(" | R=");
+      // // Serial.print(debugPwmR);
 
-      Serial.print(" | I=");
-      Serial.println(headingIntegral);
+      // Serial.print(" | I=");
+      // Serial.println(headingIntegral);
     }
   }
 
@@ -529,6 +529,33 @@ void loop()
     bnoReadTimer = millis();
     bnoStandaloneLoop();
   }
+
+  // Send IMU and Odometry data to Jetson at 50Hz (every 20ms)
+  static unsigned long sensorSendTimer = 0;
+  if (millis() - sensorSendTimer >= 20)
+  {
+    sensorSendTimer = millis();
+    
+    // Format: SENSOR:qw,qx,qy,qz,liaX,liaY,liaZ,odomX,odomY,odomH,vLin,vAng
+    // Serial.print("SENSOR:");
+    // Serial.print(imuQw, 4); Serial.print(",");
+    // Serial.print(imuQx, 4); Serial.print(",");
+    // Serial.print(imuQy, 4); Serial.print(",");
+    // Serial.print(imuQz, 4); Serial.print(",");
+    
+    // Serial.print(imuLiaX, 4); Serial.print(",");
+    // Serial.print(imuLiaY, 4); Serial.print(",");
+    // Serial.print(imuLiaZ, 4); Serial.print(",");
+    
+    // Serial.print(odometry.x, 4); Serial.print(",");
+    // Serial.print(odometry.y, 4); Serial.print(",");
+    // Serial.print(odometry.heading, 4); Serial.print(",");
+    
+    // Serial.print(velocity.linear, 4); Serial.print(",");
+    // Serial.println(velocity.angular, 4);
+  }
+
+
 
   // Autonomous drive — runs every loop() cycle for tight heading control
   Drive_Update();

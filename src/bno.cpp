@@ -4,6 +4,25 @@
 #define BNO055_ADDR 0x28
 
 float currentHeading = 0;
+float imuRoll = 0;
+float imuPitch = 0;
+
+float imuGx = 0;
+float imuGy = 0;
+float imuGz = 0;
+
+float imuAx = 0;
+float imuAy = 0;
+float imuAz = 0;
+
+float imuQw = 1.0;
+float imuQx = 0;
+float imuQy = 0;
+float imuQz = 0;
+
+float imuLiaX = 0;
+float imuLiaY = 0;
+float imuLiaZ = 0;
 
 int16_t read16(uint8_t reg)
 {
@@ -62,6 +81,21 @@ void bnoStandaloneLoop()
   float gx = read16(0x14) / 16.0;
   float gy = read16(0x16) / 16.0;
   float gz = read16(0x18) / 16.0;
+  
+  imuGx = gx;
+  imuGy = gy;
+  imuGz = gz;
+
+  // Quaternions (1 unit = 1/16384)
+  imuQw = read16(0x20) / 16384.0;
+  imuQx = read16(0x22) / 16384.0;
+  imuQy = read16(0x24) / 16384.0;
+  imuQz = read16(0x26) / 16384.0;
+
+  // Linear Acceleration (1 unit = 1 m/s^2 / 100)
+  imuLiaX = read16(0x28) / 100.0;
+  imuLiaY = read16(0x2A) / 100.0;
+  imuLiaZ = read16(0x2C) / 100.0;
 
   // Serial.print("H: "); Serial.print(heading);
   // Serial.print(" | P: "); Serial.print(pitch);
@@ -72,4 +106,4 @@ void bnoStandaloneLoop()
   // Serial.print(" Gz: "); Serial.println(gz);
 
   // delay(200);
-}
+}
