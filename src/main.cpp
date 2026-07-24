@@ -231,7 +231,18 @@ void loop()
       }
       else if (fullLine.length() == 1 && fullLine.charAt(0) == 'p')
       {
-        printAlter = !printAlter;
+        // Toggle drive pause via serial 'p'
+        Drive_TogglePause(data);
+        if (Drive_IsPaused())
+        {
+          data = 0; // zero immediately so no stale command persists
+          Serial.println("PAUSE: Triggered by serial 'p'");
+        }
+        else
+        {
+          data = Drive_GetSavedData(); // restore saved motion command
+          Serial.println("PAUSE: Resumed by serial 'p'");
+        }
       }
 
       else if (fullLine.equalsIgnoreCase("home"))
@@ -307,6 +318,20 @@ void loop()
     // directly).  Drive_IsRunning() covers queued commands (drive calls motion()).
     if (Drive_IsRunning() || Navigation_IsRunning())
     {
+      // ── Camera pause: 101 = pause task, 201 = resume task ──
+      if (!camBypass)
+      {
+        if (data == 101 && !Drive_IsPaused())
+        {
+          Drive_Pause(0);
+          Serial.println("PAUSE: camera 101");
+        }
+        else if (data == 201 && Drive_IsPaused())
+        {
+          Drive_Resume();
+          Serial.println("RESUME: camera 201");
+        }
+      }
       // Manual data is ignored while an autonomous task is executing
       data = 0;
     }
@@ -344,6 +369,14 @@ void loop()
           frontCamLocked = true;
           frontLockTime = millis();
           Serial.println("FRONT CAM: LOCKED");
+
+          // Only pause the autonomous drive task — manual mode keeps its own selective logic
+          if (Drive_IsRunning())
+          {
+            Drive_Pause(_dirData);
+            Serial.println("PAUSE: Triggered by camera cmd 101 (drive task)");
+          }
+
           // Only kill motors if current motion is a front-blocked command
           // Front-blocked: 1 (forward), 111-120 (fwd-left curve), 121-130 (fwd-right curve)
           if (_dirData == 1 || (_dirData >= 111 && _dirData <= 130))
@@ -367,7 +400,16 @@ void loop()
             frontCamLocked = false;
             Serial.println("FRONT CAM: FREE");
           }
-          data = _dirData;
+          // Resume drive mode if it was paused by 101
+          if (Drive_IsPaused())
+          {
+            Drive_Resume();
+            data = Drive_GetSavedData(); // restore saved manual command
+          }
+          else
+          {
+            data = _dirData;
+          }
         }
 
         // Back camera: 102 lock, 202 release
@@ -421,7 +463,11 @@ void loop()
       if (data != 0)
         _dirData = data;
 
-      motion(data);
+      // While paused: actively drive motors to 0 every loop to flush any ramp state
+      if (Drive_IsPaused())
+        motion(0);
+      else
+        motion(data);
     }
   }
 
@@ -463,14 +509,14 @@ void loop()
       // Serial.print(data);
       // Serial.print(" | ");
 
-      // Serial.print(" | Dist=");
-      // Serial.print(distance.travelled, 3);
+      Serial.print(" | Dist=");
+      Serial.print(distance.travelled, 3);
 
-      // Serial.print(" | Left =");
-      // Serial.print(distance.left, 3);
+      Serial.print(" | Left =");
+      Serial.print(distance.left, 3);
 
-      // Serial.print(" | Right =");
-      // Serial.println(distance.right, 3);
+      Serial.print(" | Right =");
+      Serial.println(distance.right, 3);
 
       // Serial.print(" | V=");
       // Serial.print(velocity.linear, 3);
@@ -482,26 +528,26 @@ void loop()
 
       // Serial.println(" rad/s");
 
-      // Serial.print(" D=");
-      // Serial.print(distance.travelled, 3);
+      Serial.print(" D=");
+      Serial.print(distance.travelled, 3);
 
-      // Serial.print(" OD=");
-      // Serial.print(distance.odometryTravelled, 3);
+      Serial.print(" OD=");
+      Serial.print(distance.odometryTravelled, 3);
 
-      // Serial.print(" | X=");
-      // Serial.print(odometry.x, 3);
+      Serial.print(" | X=");
+      Serial.print(odometry.x, 3);
 
-      // Serial.print(" | Y=");
-      // Serial.print(odometry.y, 3);
+      Serial.print(" | Y=");
+      Serial.print(odometry.y, 3);
 
-      // Serial.print(" | H=");
-      // Serial.print(odometry.heading, 3);
+      Serial.print(" | H=");
+      Serial.print(odometry.heading, 3);
       
 
       // Serial.println(" rad");
 
-      // Serial.print(" Heading=");
-      // Serial.print(currentHeading);
+      Serial.print(" Heading=");
+      Serial.println(currentHeading);
 
       // Serial.print(" | Target=");
       // Serial.print(targetHeading);

@@ -30,3 +30,12 @@ bool Drive_SubmitTask(const DriveCommand *commands, int count);
 bool Drive_IsRunning();
 void Drive_Cancel();
 
+// ─── Pause / Resume ────────────────────────────────────
+// Pause: freezes the drive-mode task AND saves the caller's manual motion data.
+// Resume: restores and returns the saved manual motion data (0 if nothing was running).
+void Drive_Pause(int savedData);   // call with current `data` to preserve it
+void Drive_Resume();               // re-arms drive; caller should restore returned data
+bool Drive_IsPaused();
+void Drive_TogglePause(int currentData); // flips pause↔resume, pass current `data`
+int  Drive_GetSavedData();         // returns the data value saved at pause time
+

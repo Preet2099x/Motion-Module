@@ -21,6 +21,10 @@ enum DriveState
 
 static DriveState state = DRIVE_IDLE;
 
+// ─── Pause state ──────────────────────────────────────
+static bool drivePaused = false;
+static int  pausedData  = 0;   // manual motion command saved at pause time
+
 // Per-command one-shot capture flag
 static bool commandStarted = false;
 static float startDistance = 0.0f;
@@ -95,6 +99,57 @@ void Drive_Cancel()
         resetCommandState();
         Serial.println("DRIVE: Task cancelled (emergency)");
     }
+    // Also clear pause so a fresh task can start cleanly
+    drivePaused = false;
+    pausedData  = 0;
+}
+
+// ─── Pause / Resume ──────────────────────────────────────
+
+bool Drive_IsPaused()
+{
+    return drivePaused;
+}
+
+int Drive_GetSavedData()
+{
+    return pausedData;
+}
+
+// Pause: stop motors immediately, freeze task, save manual data
+void Drive_Pause(int savedData)
+{
+    if (drivePaused)
+        return; // already paused
+
+    drivePaused = true;
+    pausedData  = savedData;
+    motion(0);  // kill motors immediately
+
+    // When we resume, commandStarted must be reset so distance/heading
+    // baselines are re-captured from the new (current) position.
+    commandStarted = false;
+
+    Serial.println("DRIVE: --- PAUSED --- (motors stopped, state saved)");
+}
+
+// Resume: un-freeze the task; caller restores the returned manual data
+void Drive_Resume()
+{
+    if (!drivePaused)
+        return; // not paused
+
+    drivePaused = false;
+    Serial.println("DRIVE: --- RESUMED ---");
+}
+
+// Toggle: one call pauses, next call resumes
+void Drive_TogglePause(int currentData)
+{
+    if (drivePaused)
+        Drive_Resume();
+    else
+        Drive_Pause(currentData);
 }
 
 bool Drive_SubmitTask(const DriveCommand *commands, int count)
@@ -217,6 +272,12 @@ void Drive_ParseTask(const String &raw)
 
 void Drive_Update()
 {
+    if (drivePaused)
+    {
+        motion(0); // actively flush ramp state every tick
+        return;
+    }
+
     if (state != DRIVE_RUNNING)
         return;
 

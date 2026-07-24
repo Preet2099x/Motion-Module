@@ -21,7 +21,10 @@ Commands:
     pos         => Print current X / Y / heading once
     debug       => Toggle live X / Y / heading stream (every 200 ms)
     1 / 15 / 0  => Sends the numeric command as-is
-    m / s / p   => Sends the single-char Teensy command
+    m / s       => Sends the single-char Teensy command
+    p           => Toggle drive PAUSE / RESUME
+                   First 'p'  => pauses (motors stop, task frozen)
+                   Second 'p' => resumes (motors restart, task continues)
     x           => CAN lock/latch toggle (physical robot stop + track cancel / release)
     quit / exit => Close the CLI
 """
@@ -152,6 +155,7 @@ def main():
     robot_locked = False
     last_track: str | None = None  # last successfully sent drive task
     debug_on = False               # tracks whether live odometry stream is active
+    drive_paused = False           # mirrors the Teensy's drive-pause state
 
     try:
         while True:
@@ -201,10 +205,21 @@ def main():
                     robot_locked = False
                 continue
 
-            # ---- Single-char Teensy commands ----
-            if lower in ("m", "s", "p"):
+            # ---- Single-char Teensy commands (m, s) ----
+            if lower in ("m", "s"):
                 ser.write((lower + "\n").encode("utf-8"))
                 print("  -> " + lower)
+                continue
+
+            # ---- Drive Pause / Resume toggle ----
+            if lower == "p":
+                ser.write(b"p\n")
+                drive_paused = not drive_paused
+                if drive_paused:
+                    print("  [PAUSE] Drive paused -- motors stopped, task frozen.")
+                    print("          Send 'p' again to resume.")
+                else:
+                    print("  [RESUME] Drive resumed -- task continuing.")
                 continue
 
             # ---- Set home ----
@@ -253,6 +268,8 @@ def main():
                     print("  ! No previous track to repeat")
                 elif robot_locked:
                     print("  ! EMERGENCY LATCHED -- track discarded. Unlock with x first.")
+                elif drive_paused:
+                    print("  ! PAUSED -- track discarded. Send 'p' to resume first.")
                 else:
                     ser.write((last_track + "\n").encode("utf-8"))
                     print("  -> (repeat) " + last_track)
@@ -263,6 +280,9 @@ def main():
                 if robot_locked:
                     print("  ! EMERGENCY LATCHED -- track discarded. Unlock with x first.")
                     continue
+                if drive_paused:
+                    print("  ! PAUSED -- track discarded. Send 'p' to resume first.")
+                    continue
                 framed = frame_task(user_input)
                 ser.write((framed + "\n").encode("utf-8"))
                 print("  -> " + framed)
@@ -272,8 +292,11 @@ def main():
             # ---- Numeric motion command ----
             try:
                 int(user_input)
-                ser.write((user_input + "\n").encode("utf-8"))
-                print("  -> " + user_input)
+                if drive_paused:
+                    print("  ! PAUSED -- motion command blocked. Send 'p' to resume first.")
+                else:
+                    ser.write((user_input + "\n").encode("utf-8"))
+                    print("  -> " + user_input)
                 continue
             except ValueError:
                 pass
