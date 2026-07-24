@@ -371,6 +371,49 @@ void motion(int _data)
     analogWrite(pwmPin_L, currentPwmL);
   }
 
+  else if (_data == 3)
+  {
+    headingHoldActive = false;
+    headingCaptureStart = 0;
+    headingIntegral = 0;
+    previousHeadingError = 0;
+    previousPidTime = 0;
+    pidError = 0;
+    pidCorrection = 0;
+    targetHeading = currentHeading;
+    
+    digitalWrite(dirPin_R, LOW);
+    digitalWrite(dirPin_L, LOW);
+    currentPwmL = straightBoost ? 150 : 120;
+    currentPwmR = straightBoost ? 150 : 120;
+    debugPwmL = currentPwmL;
+    debugPwmR = currentPwmR;
+    analogWrite(pwmPin_R, currentPwmR);
+    analogWrite(pwmPin_L, currentPwmL);
+  }
+
+  else if (_data == 4)
+  {
+    headingHoldActive = false;
+    headingCaptureStart = 0;
+    headingIntegral = 0;
+    previousHeadingError = 0;
+    previousPidTime = 0;
+    pidError = 0;
+    pidCorrection = 0;
+    targetHeading = currentHeading;
+
+    digitalWrite(dirPin_R, HIGH);
+    digitalWrite(dirPin_L, HIGH);
+    currentPwmL = straightBoost ? 150 : 120;
+    currentPwmR = straightBoost ? 150 : 120;
+    debugPwmL = currentPwmL;
+    debugPwmR = currentPwmR;
+    analogWrite(pwmPin_R, currentPwmR);
+    analogWrite(pwmPin_L, currentPwmL);
+  }
+
+
   else if (_data >= 11 && _data <= 20)
   {
     headingHoldActive = false;
