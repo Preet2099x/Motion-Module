@@ -318,18 +318,54 @@ void loop()
     // directly).  Drive_IsRunning() covers queued commands (drive calls motion()).
     if (Drive_IsRunning() || Navigation_IsRunning())
     {
-      // ── Camera pause: 101 = pause task, 201 = resume task ──
+      static unsigned long navFrontLockTime = 0;
+      static unsigned long navBackLockTime = 0;
+
+      // ── Camera pause: 101/102 = pause task, 201/202 = resume task ──
+      // Also keep frontCamLocked/backCamLocked current so Navigation can
+      // react to an obstacle (e.g. sidestep during return-home).
       if (!camBypass)
       {
-        if (data == 101 && !Drive_IsPaused())
+        if (data == 101)
         {
-          Drive_Pause(0);
-          Serial.println("PAUSE: camera 101");
+          frontCamLocked = true;
+          navFrontLockTime = millis();
         }
-        else if (data == 201 && Drive_IsPaused())
+        else if (data == 201 && frontCamLocked && (millis() - navFrontLockTime >= 500))
         {
-          Drive_Resume();
-          Serial.println("RESUME: camera 201");
+          frontCamLocked = false;
+        }
+
+        if (data == 102)
+        {
+          backCamLocked = true;
+          navBackLockTime = millis();
+        }
+        else if (data == 202 && backCamLocked && (millis() - navBackLockTime >= 500))
+        {
+          backCamLocked = false;
+        }
+
+        // Only pause/resume Drive's own queue when Drive actually owns the
+        // motors right now (a manual "T:..." task, or Navigation's
+        // FINAL_ALIGN handoff). Navigation's direct-drive phases (pursuit/
+        // parking/creep/obstacle-avoid) react to frontCamLocked themselves —
+        // Drive_Update() forces motion(0) every tick while drivePaused is
+        // true regardless of whether Drive has a task, so pausing it here
+        // while Navigation is driving directly would freeze the robot until
+        // a 201 arrived, which never happens if the robot never moves.
+        if (Drive_IsRunning())
+        {
+          if (data == 101 && !Drive_IsPaused())
+          {
+            Drive_Pause(0);
+            Serial.println("PAUSE: camera 101");
+          }
+          else if (data == 201 && Drive_IsPaused())
+          {
+            Drive_Resume();
+            Serial.println("RESUME: camera 201");
+          }
         }
       }
       // Manual data is ignored while an autonomous task is executing
@@ -509,14 +545,14 @@ void loop()
       // Serial.print(data);
       // Serial.print(" | ");
 
-      Serial.print(" | Dist=");
-      Serial.print(distance.travelled, 3);
+      // Serial.print(" | Dist=");
+      // Serial.print(distance.travelled, 3);
 
-      Serial.print(" | Left =");
-      Serial.print(distance.left, 3);
+      // Serial.print(" | Left =");
+      // Serial.print(distance.left, 3);
 
-      Serial.print(" | Right =");
-      Serial.println(distance.right, 3);
+      // Serial.print(" | Right =");
+      // Serial.println(distance.right, 3);
 
       // Serial.print(" | V=");
       // Serial.print(velocity.linear, 3);
@@ -541,13 +577,13 @@ void loop()
       Serial.print(odometry.y, 3);
 
       Serial.print(" | H=");
-      Serial.print(odometry.heading, 3);
+      Serial.println(odometry.heading, 3);
       
 
       // Serial.println(" rad");
 
-      Serial.print(" Heading=");
-      Serial.println(currentHeading);
+      // Serial.print(" Heading=");
+      // Serial.println(currentHeading);
 
       // Serial.print(" | Target=");
       // Serial.print(targetHeading);

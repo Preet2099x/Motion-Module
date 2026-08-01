@@ -126,9 +126,11 @@ void Drive_Pause(int savedData)
     pausedData  = savedData;
     motion(0);  // kill motors immediately
 
-    // When we resume, commandStarted must be reset so distance/heading
-    // baselines are re-captured from the new (current) position.
-    commandStarted = false;
+    // commandStarted/startDistance/startHeading/plannedTurnDelta are left
+    // untouched so the in-progress command keeps its original baseline —
+    // on resume it continues counting from where it left off instead of
+    // restarting (which would silently add the pre-pause distance/turn
+    // on top of the target again).
 
     Serial.println("DRIVE: --- PAUSED --- (motors stopped, state saved)");
 }

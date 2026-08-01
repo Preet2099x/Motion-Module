@@ -1,9 +1,11 @@
 #include <Arduino.h>
 #include <math.h>
+#include <var.h>
 
 #include "navigation.h"
 #include "drive.h"
 #include "odometry.h"
+#include "distance.h"
 
 // Forward declaration from var.h — motion() drives the motors directly
 extern void motion(int _data);
@@ -13,10 +15,11 @@ extern void motion(int _data);
 enum NavigationState
 {
     NAV_IDLE,
-    NAV_PURSUIT,      // Arcing/driving toward home
-    NAV_PARKING,      // Close to home — slow approach
-    NAV_CREEP,        // Very close — precision align-then-inch
-    NAV_FINAL_ALIGN   // At home — turning to heading 0°
+    NAV_PURSUIT,        // Arcing/driving toward home
+    NAV_PARKING,        // Close to home — slow approach
+    NAV_CREEP,          // Very close — precision align-then-inch
+    NAV_FINAL_ALIGN,    // At home — turning to heading 0°
+    NAV_OBSTACLE_AVOID  // Front camera locked — turn/advance/turn-back sidestep
 };
 
 static NavigationState state = NAV_IDLE;
@@ -41,6 +44,35 @@ static const float PARK_ARC_ZONE      = 20.0f;
 // Creep heading-error threshold — must align precisely before inching forward
 static const float CREEP_ALIGN_ZONE   = 1.0f;  // degrees (strict alignment)
 
+// Obstacle-avoidance ("go around it") tuning
+static const float OBSTACLE_TURN_ANGLE     = 90.0f; // degrees to sidestep, either side
+static const float OBSTACLE_ADVANCE_DIST   = 0.40f; // metres driven past the obstacle
+static const float OBSTACLE_TURN_TOLERANCE = 1.0f;  // degrees — turn done within this
+static const float OBSTACLE_TURN_CRAWL_ZONE = 5.0f;
+static const float OBSTACLE_TURN_SLOW_ZONE  = 15.0f;
+
+// ─── Obstacle-avoidance state ──────────────────────────
+// The maneuver drives motion() directly (like PURSUIT/PARKING/CREEP) instead
+// of handing off to Drive — this keeps it immune to Drive's pause flag, which
+// must never freeze Navigation's own direct-drive phases. It keeps retrying
+// (alternating sides) for as long as frontCamLocked stays true; there is no
+// give-up — a camera lock is always something to route around, never a
+// reason to just sit still.
+enum ObstaclePhase
+{
+    OBSTACLE_TURN_AWAY, // turning ~90 deg off the original heading
+    OBSTACLE_ADVANCE,   // driving past the obstacle
+    OBSTACLE_TURN_BACK  // turning back to the original heading
+};
+
+static NavigationState obstacleReturnState = NAV_PURSUIT; // phase to resume once clear
+static float obstacleOriginalHeading = 0.0f;              // heading to restore once clear (fixed across retries)
+static float obstacleTargetHeading = 0.0f;                // current turn sub-step's target
+static float obstacleStartDistance = 0.0f;                // distance.travelled baseline for the advance step
+static ObstaclePhase obstaclePhase = OBSTACLE_TURN_AWAY;
+static bool  obstacleTryRightNext = true;                 // alternate sides each attempt
+static int   obstacleRetryCount = 0;                      // informational only — no cap
+
 // ─── Helpers ───────────────────────────────────────────
 
 static float normalizeAngle(float angle)
@@ -48,6 +80,16 @@ static float normalizeAngle(float angle)
     while (angle > 180.0f)
         angle -= 360.0f;
     while (angle < -180.0f)
+        angle += 360.0f;
+    return angle;
+}
+
+// Wrap to [0, 360) — the convention odometry.heading / CMD_TURN_TO_ABS use.
+static float wrapTo360(float angle)
+{
+    while (angle >= 360.0f)
+        angle -= 360.0f;
+    while (angle < 0.0f)
         angle += 360.0f;
     return angle;
 }
@@ -66,11 +108,124 @@ static float calculateHeadingToHome()
     return heading; // in odometry space (0–360 deg)
 }
 
+// Pick a side (alternating each call) and (re)start the turn-away sub-phase.
+// Does NOT touch obstacleOriginalHeading/obstacleReturnState — those stay
+// fixed for the whole retry sequence so the reference direction never drifts.
+static void pickSideAndStartTurn()
+{
+    float turnSign = obstacleTryRightNext ? 1.0f : -1.0f;
+    obstacleTryRightNext = !obstacleTryRightNext; // alternate side on next attempt
+
+    obstacleTargetHeading = wrapTo360(obstacleOriginalHeading + turnSign * OBSTACLE_TURN_ANGLE);
+    obstaclePhase = OBSTACLE_TURN_AWAY;
+
+    Serial.print("NAVIGATION: Sidestepping ");
+    Serial.print(turnSign > 0 ? "right (" : "left (");
+    Serial.print(OBSTACLE_TURN_ANGLE, 0);
+    Serial.println(" deg) to get around obstacle");
+}
+
+// First entry into obstacle avoidance from a driving phase (PURSUIT/PARKING/
+// CREEP) — captures the heading to come back to once clear.
+static void beginObstacleManeuver(NavigationState returnState)
+{
+    obstacleReturnState = returnState;
+    obstacleOriginalHeading = odometry.heading;
+    obstacleRetryCount = 0;
+    motion(0);
+    pickSideAndStartTurn();
+    state = NAV_OBSTACLE_AVOID;
+}
+
+// Turn in place toward `target`, tiering speed by remaining error like
+// Drive's CMD_LEFT/RIGHT. Returns true once within tolerance.
+static bool driveTowardHeading(float target)
+{
+    float remaining = normalizeAngle(target - odometry.heading);
+    float absRemaining = fabs(remaining);
+
+    if (absRemaining <= OBSTACLE_TURN_TOLERANCE)
+    {
+        motion(0);
+        return true;
+    }
+
+    bool turnRight = remaining > 0;
+    if (absRemaining <= OBSTACLE_TURN_CRAWL_ZONE)
+        motion(turnRight ? 11 : 21);
+    else if (absRemaining <= OBSTACLE_TURN_SLOW_ZONE)
+        motion(turnRight ? 13 : 23);
+    else
+        motion(turnRight ? 15 : 25);
+
+    return false;
+}
+
+// Runs one tick of the current obstacle-avoidance sub-phase. Called every
+// loop while state == NAV_OBSTACLE_AVOID.
+static void updateObstacleAvoid()
+{
+    switch (obstaclePhase)
+    {
+    case OBSTACLE_TURN_AWAY:
+        if (driveTowardHeading(obstacleTargetHeading))
+        {
+            obstacleStartDistance = distance.travelled;
+            obstaclePhase = OBSTACLE_ADVANCE;
+            Serial.println("NAVIGATION: Turn complete — advancing past obstacle");
+        }
+        break;
+
+    case OBSTACLE_ADVANCE:
+        // The sidestep direction can be blocked too — don't just sit here,
+        // immediately try the other side instead of waiting it out.
+        if (frontCamLocked)
+        {
+            motion(0);
+            obstacleRetryCount++;
+            Serial.println("NAVIGATION: Sidestep path also blocked — trying other side");
+            pickSideAndStartTurn();
+            break;
+        }
+
+        if (distance.travelled - obstacleStartDistance >= OBSTACLE_ADVANCE_DIST)
+        {
+            motion(0);
+            obstaclePhase = OBSTACLE_TURN_BACK;
+            Serial.println("NAVIGATION: Cleared obstacle — turning back on course");
+        }
+        else
+        {
+            motion(1); // straight forward
+        }
+        break;
+
+    case OBSTACLE_TURN_BACK:
+        if (driveTowardHeading(obstacleOriginalHeading))
+        {
+            if (frontCamLocked)
+            {
+                obstacleRetryCount++;
+                Serial.println("NAVIGATION: Still blocked on original course — retrying sidestep");
+                pickSideAndStartTurn();
+            }
+            else
+            {
+                Serial.println("NAVIGATION: Path clear — resuming return-home");
+                obstacleRetryCount = 0;
+                state = obstacleReturnState;
+            }
+        }
+        break;
+    }
+}
+
 // ─── Public API ────────────────────────────────────────
 
 void Navigation_Init()
 {
     state = NAV_IDLE;
+    obstacleRetryCount = 0;
 }
 
 bool Navigation_IsRunning()
@@ -80,10 +235,15 @@ bool Navigation_IsRunning()
 
 void Navigation_Cancel()
 {
-    if (state == NAV_PURSUIT || state == NAV_PARKING || state == NAV_CREEP)
+    if (state == NAV_PURSUIT || state == NAV_PARKING || state == NAV_CREEP || state == NAV_OBSTACLE_AVOID)
     {
         motion(0); // Stop motors since we were driving directly
     }
+    else if (state == NAV_FINAL_ALIGN)
+    {
+        Drive_Cancel(); // this phase hands off to Drive — cancel it too
+    }
+    obstacleRetryCount = 0;
     state = NAV_IDLE;
 }
 
@@ -91,6 +251,9 @@ void Navigation_ReturnHome()
 {
     if (state != NAV_IDLE)
         return;
+
+    obstacleRetryCount = 0;
+    obstacleTryRightNext = true;
 
     float dx = -odometry.x;
     float dy = -odometry.y;
@@ -124,6 +287,24 @@ void Navigation_Update()
 {
     if (state == NAV_IDLE)
         return;
+
+    // ── OBSTACLE DETECTED: switch into the sidestep maneuver ─────────
+    // Only the driving phases react here — FINAL_ALIGN hands off to Drive
+    // and is covered by Drive's own camera-pause instead.
+    if ((state == NAV_PURSUIT || state == NAV_PARKING || state == NAV_CREEP) && frontCamLocked)
+    {
+        beginObstacleManeuver(state);
+        return;
+    }
+
+    // ── OBSTACLE AVOID: run the turn/advance/turn-back sequence directly.
+    // Keeps retrying (alternating sides) for as long as frontCamLocked is
+    // true — never just stops and waits for the obstacle to move itself.
+    if (state == NAV_OBSTACLE_AVOID)
+    {
+        updateObstacleAvoid();
+        return;
+    }
 
     // ── PURSUIT: arc toward home at full speed ──────────
     if (state == NAV_PURSUIT)
