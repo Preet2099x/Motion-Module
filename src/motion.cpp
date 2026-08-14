@@ -33,7 +33,7 @@ const float KiF = 0.1f;
 const float KdF = 0.08f;
 
 const float KpB = 2.5f;
-const float KiB = 0.15f;
+const float KiB = 0.35f;
 const float KdB = 0.08f;
 
 // const float KpB = 8.0f;
