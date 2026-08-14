@@ -28,13 +28,13 @@ unsigned long previousPidTime = 0;
 
 static unsigned long boostCommandTimer = 0;
 
-const float KpF = 2.0f;
+const float KpF = 2.4f;
 const float KiF = 0.1f;
-const float KdF = 0.05f;
+const float KdF = 0.08f;
 
-const float KpB = 1.0f;
-const float KiB = 0.1f;
-const float KdB = 0.05f;
+const float KpB = 2.5f;
+const float KiB = 0.15f;
+const float KdB = 0.08f;
 
 // const float KpB = 8.0f;
 // const float KiB = 0.10f;
@@ -282,7 +282,7 @@ void motion(int _data)
         pidError = error;
         pidCorrection = correction;
 
-        currentPwmL = constrain(pwm +10 + correction, 0, 255);
+        currentPwmL = constrain(pwm + correction, 0, 255);
         currentPwmR = constrain(pwm - correction, 0, 255);
 
         debugPwmL = currentPwmL;
@@ -295,7 +295,7 @@ void motion(int _data)
     else
     {
       currentPwmL = pwm;
-      currentPwmR = pwm+5;
+      currentPwmR = pwm;
 
       debugPwmL = currentPwmL;
       debugPwmR = currentPwmR;
