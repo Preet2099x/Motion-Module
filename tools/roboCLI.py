@@ -26,8 +26,15 @@ Commands:
     followstop  => Stop follow-me
     followmon   => Toggle live beacon readout with motors idle (safe bring-up)
     followcfg   => Print follow-me configuration + current beacon fix
-    followd <m> => Set A<->B anchor spacing in metres (default 0.545)
-    followr <m> => Set standoff: how far in front of you it stops (default 1.20)
+    followrev   => Invert which way "right"/"left" spins the motors
+    followfb    => Invert the front/back sense (if front reads as behind)
+    followturn  => TURN-ONLY: aim at the beacon and hold, never drive
+    followtri   => Toggle THRESHOLD vs TRILATERATION+45deg-sector method
+    followm <m> => Comparison noise margin in metres (default 0.15)
+    followl <m> => Leg length: how far it drives between looks (default 1.00)
+    followr <m> => Stop range in metres (default 2.00)
+    followg <m> => Resume range: start following again past this (default 2.30)
+    followp <m> => Hard stop when any raw anchor reads under <m> (default 0.70)
     p           => Toggle drive PAUSE / RESUME
                    First 'p'  => pauses (motors stop, task frozen)
                    Second 'p' => resumes (motors restart, task continues)
@@ -278,7 +285,7 @@ def main():
             # followmon/followcfg/followdbg are read-only, so they stay
             # available even while latched -- being able to look at the beacon
             # fix without arming the motors is the whole point of monitor mode.
-            if lower in ("followmon", "followcfg", "followdbg"):
+            if lower in ("followmon", "followcfg", "followdbg", "followrev", "followfb", "followtri", "followturn"):
                 ser.write((lower + "\n").encode("utf-8"))
                 print("  -> " + lower)
                 continue
@@ -308,8 +315,8 @@ def main():
                 print("  -> followstop")
                 continue
 
-            # followd <m> / followr <m>  -- anchor spacing / standoff range
-            m_follow = re.match(r"^(followd|followr)\s+([0-9]*\.?[0-9]+)$", lower)
+            # followm/followl/followr/followg/followp <m> -- tuning values
+            m_follow = re.match(r"^(followm|followl|followr|followg|followp)\s+([0-9]*\.?[0-9]+)$", lower)
             if m_follow:
                 ser.write((m_follow.group(1) + " " + m_follow.group(2) + "\n").encode("utf-8"))
                 print("  -> " + m_follow.group(1) + " " + m_follow.group(2))

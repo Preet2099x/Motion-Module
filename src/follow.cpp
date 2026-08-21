@@ -1,171 +1,223 @@
 #include "follow.h"
 #include "drive.h"
 #include "navigation.h"
+#include "distance.h"
+#include "velocity.h"
 
 #include <Arduino.h>
 #include <math.h>
 #include <var.h>
 
-// ─── Geometry ──────────────────────────────────────────
+// ─── How this works ─────────────────────────────────────
 //
-// A is the beacon on the FRONT of the robot, B the one on the BACK, a fixed
-// baseline `d` apart.  Both report their range to the single fixed "main"
-// beacon the operator carries.  With R the range from the robot centre to the
-// main beacon and theta the beacon's bearing off the robot's forward axis, the
-// law of cosines gives
+// Three anchors range to the beacon the operator carries:
 //
-//     A^2 = R^2 + (d/2)^2 - R*d*cos(theta)
-//     B^2 = R^2 + (d/2)^2 + R*d*cos(theta)
+//     A  FORWARD  — mounted pointing forward
+//     B  RIGHT    — mounted on the right
+//     C  LEFT     — mounted on the left
 //
-// which inverts exactly to
+//     B <-> C   = 30 cm
+//     A <-> B   = A <-> C  = 34-35 cm
 //
-//     R          = sqrt( (A^2 + B^2)/2 - (d/2)^2 )
-//     cos(theta) = (B^2 - A^2) / (2*R*d)
+// No trigonometry anywhere in this file. Direction comes from plain
+// comparisons between the three raw ranges — whichever anchor reads closer is
+// the direction the beacon is more toward. That is the whole method.
 //
-// theta therefore comes out as a MAGNITUDE in [0, 180]:
-//     ~0    beacon dead ahead          (A much smaller than B)
-//     ~90   beacon straight off a side (A == B)
-//     ~180  beacon dead astern         (A much larger than B)
+//     rightness = C - B     positive -> B is closer -> beacon is to the RIGHT
+//     frontness = avg(B,C) - A   positive -> A is closer -> beacon is AHEAD
 //
-// Two ranges are symmetric about the robot's long axis, so they can never say
-// whether the beacon is to the LEFT or the RIGHT.  That sign is resolved by
-// rotating and checking which of the two hypotheses predicted the next reading
-// better -- see the side-inference note further down -- and then held under a
-// confidence counter so noise cannot keep reversing it.  Between fixes the
-// bearing is carried forward on the IMU, so steering runs at loop rate off a
-// 1 Hz sensor.
+// The frontness sign was checked against this exact geometry (A 31 cm ahead of
+// the B-C line, B/C 15 cm either side): projecting a far beacon at bearing t
+// onto each anchor gives A closer whenever cos(t) > 0, i.e. whenever the
+// beacon is genuinely ahead.  So "front" is A SMALLER than B and C, not larger
+// — if that reads backwards on the real hardware, `followfb` flips the sign in
+// one command rather than needing a re-derivation.
+//
+// Combining the two comparisons with a noise margin gives 8 buckets (compass
+// points) plus "aligned".  Each bucket maps to one action:
+//
+//     aligned / FRONT        -> drive forward
+//     FRONT-LEFT/RIGHT       -> small nudge turn, then look again
+//     LEFT / RIGHT           -> bigger turn, then look again
+//     BACK-LEFT/RIGHT/BACK   -> biggest turn, then look again
+//
+// Every turn is followed by a completely fresh measurement and a fresh
+// decision — there is no "was the turn good" judgement to get wrong, which is
+// what caused the infinite-turn bug in the earlier trig-based version. The
+// tradeoff is that this needs the margin to be bigger than the sensor noise,
+// or two consecutive readings can disagree on the bucket and the robot
+// dithers; `followm` tunes that margin live.
+//
+// "Range" for the stop/resume/drive-leg logic is just the average of the three
+// readings — not a real geometric range, an approximation good enough for a
+// threshold with hysteresis. The proximity stop is separate and reads the raw
+// per-anchor minimum directly, with no averaging at all.
 
 // ─── Tuning ────────────────────────────────────────────
 
-static float beaconBaseline = 0.545f; // d — metres between beacon A and B (measured 54-55 cm)
-static float standoffRange = 1.20f;  // m — stop this far from the operator
+static float stopRange = 2.00f;   // m — average range below this: stop
+static float resumeRange = 2.30f; // m — average range above this: follow again
 
-static const float RANGE_HYSTERESIS = 0.30f; // m — resume driving past standoff+this
-static const float CRUISE_MARGIN = 1.00f;    // m — full speed only beyond standoff+this
-
-// Bearing thresholds.  These are deliberately loose, and that is a property
-// of the sensor, not a shortcut.  cos(theta) is flat near 0 deg, so range
-// noise blows up into apparent bearing exactly where the robot is already
-// aligned: with d = 0.5 m, 4 cm range noise and 8 averaged samples, a beacon
-// that is truly dead ahead still reads ~7 deg +/- 8.  Off-axis the same setup
-// is good to ~3 deg.  So: trust the bearing when it is large, and treat
-// anything under ALIGN_TOL as "aligned" rather than hunting inside the noise.
-// Mounting A and B further apart is what actually buys resolution here --
-// the floor scales as 1/d, so d = 1.0 m roughly halves it (see `followd`).
-static const float ALIGN_TOL = 20.0f;   // deg — close enough to drive forward
-static const float REALIGN_TOL = 40.0f; // deg — drifted far enough to re-aim
-
-// Arc steering.  Between ALIGN_TOL and ARC_TOL the robot curves toward the
-// beacon WHILE driving instead of stopping to spin on the spot.  This is what
-// removes the stop-turn-stop-turn shuffle: an operator walking ahead only ever
-// drifts a few tens of degrees off the nose, and that is entirely correctable
-// on the move.  Only a genuinely large error (or an unknown side) is worth
-// stopping for.
-static const float ARC_TOL = 70.0f; // deg — beyond this, spin in place instead
-
-// Probe stepping — used ONLY when the side is unknown.
-static const float PROBE_STEP = 25.0f; // deg — big enough to beat bearing noise
-
-// ─── Which side is the beacon on? ──────────────────────
+// Noise margin for the front/back and left/right comparisons. A difference
+// smaller than this is treated as "can't tell" rather than acted on — the
+// single biggest defence against dithering on sensor noise.
+// THIS HAS A HARD PHYSICAL CEILING. The signals cannot exceed the anchor
+// spacings that produce them:
 //
-// Two ranges are symmetric about the robot's long axis, so the geometry yields
-// |theta| but never the side.  The side is *inferred*: we know how far we just
-// rotated (IMU) and which way (we commanded it), so each hypothesis makes a
-// testable prediction for the next reading —
+//     max |frontness| = A's forward offset  = 0.311 m
+//     max |rightness| = B-to-C full spacing = 0.300 m
 //
-//     beacon on the right : theta_next = |theta_prev - rot|
-//     beacon on the left  : theta_next = |theta_prev + rot|
+// So the margin is not a free tuning knob — it is a fraction of a very small
+// range. If it is set too high, there are angles where NEITHER signal can
+// ever clear it, and the beacon becomes invisible. That happens above
+// 0.216 m, from (m/0.311)^2 + (m/0.300)^2 >= 1.
 //
-// — and whichever prediction lands closer to the measurement wins.  That is a
-// far stronger test than the old "did theta improve by 2 deg", which at 1 Hz
-// flips on sensor noise alone and produced exactly the left-right-left shuffle
-// this replaces.  The confidence counter then makes a locked-in side expensive
-// to unseat: one bad fix costs a point, it does not reverse the robot.
-static const float SIGN_MARGIN_DEG = 5.0f; // predictions must differ by this to count
-static const int SIGN_CONF_MAX = 3;        // cap on accumulated confidence
-static const float SIGN_MIN_ROT = 5.0f;    // deg — less rotation than this proves nothing
+// It was previously 0.25, i.e. past that limit, which opened a blind cone
+// around +-135 deg — beacon behind and off to a side, both signals maxing out
+// at ~0.21. A real log showed exactly this: a stationary beacon at 130-180 deg
+// read as "can't tell", the fallback drove forward, and the robot walked away
+// from it for the entire run, range climbing 2.94 -> 4.24 m.
+//
+// (An earlier tuning pass "measured" 0.25 as better than 0.15. That test grid
+// sampled bearings at 10/45/80/120/170 deg and simply never landed in the
+// blind cone. Re-run on a dense 15 deg grid, 0.15 converges in 3.9 turns and
+// 0.25 in 8.6.)
+static float compareMargin = 0.15f; // m
 
-// Settling: after each step the motors are stopped and the range filter is
-// flushed, so the next evaluation sees only readings taken while stationary.
-// motion(0) ramps PWM down rather than cutting it, so the robot is still
-// moving for ~300 ms afterwards — BRAKE_MS covers that coast before the
-// filter is flushed, otherwise the "stopped" readings are anything but.
-static const unsigned long BRAKE_MS = 350;
-static const unsigned long SETTLE_MS = 350;
-// Sized for the ~1 Hz beacon feed this rig actually produces. Every sample
-// count here is a WALL-CLOCK cost: at 1 Hz, 8 samples is 8 seconds of the
-// robot sitting still after every single turn step, which makes following a
-// walking person impossible. If you raise the Jetson's send rate to 5-10 Hz,
-// put this back to 8 and MIN_SAMPLES back to 6 — the bearing gets much
-// quieter and none of the timing hurts any more.
-static const int SETTLE_SAMPLES = 2;
+// Turn sizes per bucket. Larger for buckets further from "already aimed".
+// Slightly bigger than the wider margin alone accounts for: undershooting
+// costs a whole extra look-and-turn cycle, overshooting costs the same, so
+// biasing a little long is cheaper on average than biasing short.
+static const float TURN_NUDGE = 25.0f; // deg — FRONT-LEFT / FRONT-RIGHT
+static const float TURN_SIDE = 65.0f;  // deg — LEFT / RIGHT
+static const float TURN_BACK = 110.0f; // deg — BACK-LEFT / BACK-RIGHT / BACK
 
-// Filtering
-// The EMA is what keeps the bearing usable -- more averaging buys a quieter
-// theta -- but every averaged sample costs wall-clock time at 1 Hz. alpha 0.5
-// averages ~3 readings, already a ~3 s lag on a walking operator; slower than
-// that tracks where they were, not where they are. At 5-10 Hz, 0.25 is the
-// better number (~7 readings, roughly +/-8 deg instead of +/-13 at d=0.5 m).
-static const float FILTER_ALPHA = 0.50f; // EMA on each raw range
-static const int MIN_SAMPLES = 2;        // samples before the filter is trusted
+// A direction decided by a TIEBREAK (one axis confident, the other just a
+// sub-margin lean) is real evidence but not enough to commit the full turn
+// to. So: turn this little instead, then measure fresh as normal. If the
+// lean was right, the next look either agrees again (another small probe,
+// now closer) or clears the margin outright (now confident -> full turn).
+// If the lean was wrong, the next look sees the OPPOSITE sign and classify()
+// just returns a different bucket — there is no separate "was that turn
+// good" judgement to write or get wrong; the existing fresh-measurement-
+// every-time design does the verify-or-abandon step for free.
+static const float PROBE_STEP = 12.0f; // deg
 
-// Safety
-// Must clear the beacon's send PERIOD with margin: at 1 Hz a 1500 ms timeout
-// trips on any half-second of jitter and the robot reports "data lost".
-static const unsigned long DATA_TIMEOUT_MS = 3500;  // no beacon line -> stop
-static const unsigned long DEBUG_INTERVAL_MS = 500;
+// How far to drive before stopping to look again.
+static float legLength = 1.00f; // m — max distance driven before stopping to recompute
+
+// Hard proximity stop on the RAW per-anchor ranges — no averaging, no
+// geometry. If any single anchor reads under this, stop immediately.
+static float proximityStopRange = 0.70f;
+static const float PROXIMITY_RELEASE = 0.30f; // m — extra before resuming
+
+static const int MEASURE_SAMPLES = 4;
+static const unsigned long BRAKE_MS = 400; // motion(0) coast before trusting a sample
+static const unsigned long MEASURE_TIMEOUT_MS = 9000;
+
+static const float COAST_S = 0.35f; // motion(0) ramp-down before it truly stops
+
+static const unsigned long DATA_TIMEOUT_MS = 3500;
+static const unsigned long DEBUG_INTERVAL_MS = 700;
+
+// If the robot turns this many times in a row without ever reaching a
+// FRONT-ish bucket, something is wrong (inverted sense, bad margin, side
+// facing wrong way) — flag it instead of spinning silently forever.
+static const int STUCK_TURN_WARNING = 8;
 
 // ─── State ─────────────────────────────────────────────
 
 enum FollowState
 {
     FOLLOW_OFF,
-    FOLLOW_ACQUIRE,   // waiting for usable beacon data
-    FOLLOW_TURN_STEP, // rotating one step toward the beacon
-    FOLLOW_SETTLE,    // stopped, refilling the filter before judging the step
-    FOLLOW_DRIVE,     // aligned — driving at the beacon
-    FOLLOW_HOLD       // inside the standoff — stopped, still facing the beacon
+    FOLLOW_MEASURE, // stopped, averaging a clean fix
+    FOLLOW_TURN,    // rotating a fixed amount for the current bucket
+    FOLLOW_DRIVE,   // driving one leg, roughly toward the beacon
+    FOLLOW_HOLD     // close enough — stopped until they walk away
+};
+
+enum Direction
+{
+    DIR_FRONT,
+    DIR_FRONT_RIGHT,
+    DIR_FRONT_LEFT,
+    DIR_RIGHT,
+    DIR_LEFT,
+    DIR_BACK_RIGHT,
+    DIR_BACK_LEFT,
+    DIR_BACK
 };
 
 static FollowState state = FOLLOW_OFF;
 static bool followDebug = true;
-static bool followMonitor = false; // live readout while disarmed (bring-up)
+static bool followMonitor = false;
 
-// Beacon measurement state
-static float filtA = 0.0f;
-static float filtB = 0.0f;
-static int sampleCount = 0;
+static bool turnInvert = false; // flips which way "right"/"left" spins the motors
+static bool fbInvert = false;   // flips which way frontness is read
+
+// Alternate classifier: exact trilateration + atan2 + 45deg sectors, instead
+// of the threshold-comparison method above. Simulated against the measured
+// hardware noise this converges in ~3.2 turns on average vs ~1.7 for the
+// threshold method — sector boundaries have no deadband, so noise near any
+// boundary flips the answer, same failure mode as the margin-less comparison
+// table this project already moved past once. Kept in as a live-toggleable
+// A/B test (`followtri`) because simulation is a model, not the real robot.
+static bool useTrilateration = false;
+
+// TURN-ONLY mode: aim at the beacon and stop. Never drives, never closes
+// distance, never stops on range. This isolates the direction logic from
+// everything else — if the robot ends up facing you and holds still, the
+// classification is right and any remaining problem is in the driving; if it
+// faces the wrong way, the problem is upstream of driving entirely.
+// Once aimed it keeps re-measuring, so moving the beacon makes it re-aim.
+static bool turnOnlyMode = false;
+
+// A's forward offset from the B-C line, and B/C's half-spacing from centre —
+// used ONLY by the trilateration path. sqrt(34.5^2-15^2) and 30/2 cm.
+static const float TRI_HA = 0.3107f;
+static const float TRI_HALF = 0.15f;
+
+// Accumulator for the stationary average
+static float accA = 0.0f, accB = 0.0f, accC = 0.0f;
+static int accN = 0;
+static unsigned long measureStart = 0;
+static bool measureBraked = false;
+
+// Latest averaged fix
+static float avgA = 0.0f, avgB = 0.0f, avgC = 0.0f;
+static float avgRange = 0.0f;
+static Direction lastDir = DIR_FRONT;
+static bool lastWasTiebreak = false; // classify() set this from a weak lean, not a confident reading
+
+// Raw, unfiltered, for the proximity stop
+static float rawA = 0.0f, rawB = 0.0f, rawC = 0.0f;
+static bool proximityLatched = false;
 static unsigned long lastSampleMs = 0;
 
-static float beaconRange = 0.0f; // R, metres
-static float beaconTheta = 0.0f; // |bearing| off the forward axis, 0..180 deg
+// Leg / turn bookkeeping
+// Live check while driving a leg -- unlike a turn, driving straight doesn't
+// rotate the robot, so a reading taken mid-leg reflects the beacon's CURRENT
+// bearing from an unchanging heading rather than being smeared across
+// different headings the way one taken mid-turn would be. That's what makes
+// it safe to look without stopping. It's still 3 quick samples rather than
+// the full 4-sample stationary average, so the margin is looser than
+// compareMargin: measured against real noise, 0.30m / 3 samples false-
+// triggers on a genuinely aligned leg only ~1.6% of the time per check, cheap
+// insurance against blindly finishing a whole leg after the operator has
+// clearly moved off to a side.
+static const unsigned long DRIVE_SNAPSHOT_MS = 3000;
+static const int DRIVE_SNAPSHOT_SAMPLES = 3;
+static const float DRIVE_CHECK_MARGIN = 0.30f;
+static float driveAccA = 0.0f, driveAccB = 0.0f, driveAccC = 0.0f;
+static int driveAccN = 0;
+static unsigned long driveSnapshotTimer = 0;
 
-// Turn state
+static float legStartTravel = 0.0f;
+static float legStartRange = 0.0f;
+static float turnStartHeading = 0.0f;
+static float turnStepSize = 0.0f;
 static int turnSign = 1; // +1 = right, -1 = left
-static float stepStartHeading = 0.0f;
-static float stepSize = 0.0f; // deg planned for the current step
-
-// Signed-bearing tracking.  beaconTheta is the raw magnitude from the last
-// fix; bearingSigned is that magnitude carrying the inferred side, kept
-// current between fixes by folding in the robot's own rotation.  At 1 Hz that
-// dead-reckoning is what allows smooth control at loop rate instead of one
-// jerk per second.
-static float bearingSigned = 0.0f; // + = beacon to the right of the nose
-static int signConfidence = 0;     // 0 = side unknown (probe); >0 = locked in
-static float thetaAtLastFix = 0.0f;
-static float rotSinceFix = 0.0f; // deg rotated since last fix, + = right
-static bool haveLastFix = false;
-
-// Rotation bookkeeping.  activeTurnSign is the direction we are *commanding*
-// right now, so the IMU only ever has to supply a magnitude — this never
-// depends on which way the BNO happens to count its heading.
-static float prevHeading = 0.0f;
-static bool headingTracked = false;
-static int activeTurnSign = 0; // +1 right, -1 left, 0 = straight/stopped
-
-static unsigned long settleStart = 0;
-static bool settleJudgesStep = false;    // false when we settled without turning
-static bool settleFilterCleared = false; // brake phase done, now sampling
+static int consecutiveTurns = 0;
 
 static unsigned long debugTimer = 0;
 static bool camStopReported = false;
@@ -181,220 +233,343 @@ static float normalizeAngle(float angle)
     return angle;
 }
 
-static void resetFilter()
-{
-    sampleCount = 0;
-}
-
-// Forget everything inferred about the beacon's side. Used on arm/disarm and
-// whenever the link drops, so a new follow never inherits a stale side.
-static void resetTracking()
-{
-    bearingSigned = 0.0f;
-    signConfidence = 0;
-    thetaAtLastFix = 0.0f;
-    rotSinceFix = 0.0f;
-    haveLastFix = false;
-    headingTracked = false;
-    activeTurnSign = 0;
-}
-
-static bool dataValid()
-{
-    return (sampleCount >= MIN_SAMPLES);
-}
-
-// Motion code for an in-place turn, tiered by how much is left to rotate.
-// Follow-me stays on the slow tiers: theta lags the true bearing by a filter
-// time constant, so a fast spin overshoots before the estimate catches up.
+// motion.cpp: forward is both dir pins LOW; 11-20 drives the left wheel
+// forward and reverses the right (spins RIGHT), 21-30 the opposite.
+// turnInvert swaps them if the robot disagrees in the field.
 static int turnCode(float remaining, int s)
 {
-    if (remaining <= 6.0f)
-        return (s > 0) ? 11 : 21; // crawl, PWM 60
+    if (turnInvert)
+        s = -s;
+
     if (remaining <= 20.0f)
-        return (s > 0) ? 14 : 24; // slow, PWM 80
-    return (s > 0) ? 17 : 27;     // mid, PWM 120
+        return (s > 0) ? 11 : 21; // PWM 60
+    if (remaining <= 45.0f)
+        return (s > 0) ? 14 : 24; // PWM 80
+    return (s > 0) ? 17 : 27;     // PWM 120
 }
 
-// Forward curve toward side `s`, tiered by how far off the nose the beacon is.
-// motion.cpp drives 111-120 with the LEFT wheel faster (curves right) and
-// 121-130 with the RIGHT wheel faster (curves left), matching the 1x=right /
-// 2x=left convention the in-place turns use.  (The camera-block comment in
-// main.cpp labels these two ranges the other way round; it blocks both
-// together, so the mislabel has never had a functional effect.)
-static int arcCode(float theta, int s)
+static float brakeLead()
 {
-    int base = (s > 0) ? 111 : 121;
-    if (theta < 30.0f)
-        return base + 1; // 112 / 122 — gentle
-    if (theta < 50.0f)
-        return base + 4; // 115 / 125 — medium
-    return base + 7;     // 118 / 128 — sharp
+    float lead = fabs(velocity.linear) * COAST_S;
+    return (lead > 0.50f) ? 0.50f : lead;
 }
 
-// Every follow-me motion command goes through here so activeTurnSign can never
-// fall out of step with what the motors are actually doing — the rotation
-// tracker below depends on knowing which way we asked the robot to turn.
-static void followMotion(int code, int turning)
+static bool proximityBlocked()
 {
-    activeTurnSign = turning;
-    motion(code);
-}
+    float nearest = (rawA < rawB) ? rawA : rawB;
+    if (rawC > 0.0f && rawC < nearest)
+        nearest = rawC;
 
-// Fold the rotation since the previous tick into the signed bearing, and into
-// the running total the side test consumes.  The IMU supplies only a
-// magnitude; the direction comes from the command we issued, so none of this
-// depends on which way the BNO counts its heading.
-static void trackRotation()
-{
-    if (!headingTracked)
+    if (nearest <= 0.0f)
+        return proximityLatched;
+
+    if (proximityLatched)
     {
-        prevHeading = currentHeading;
-        headingTracked = true;
-        return;
+        if (nearest > proximityStopRange + PROXIMITY_RELEASE)
+            proximityLatched = false;
+    }
+    else if (nearest < proximityStopRange)
+    {
+        proximityLatched = true;
     }
 
-    float dmag = fabs(normalizeAngle(currentHeading - prevHeading));
-    prevHeading = currentHeading;
-
-    if (activeTurnSign == 0 || dmag < 0.01f)
-        return;
-
-    float rot = activeTurnSign * dmag;
-    rotSinceFix += rot;
-    bearingSigned = normalizeAngle(bearingSigned - rot);
-
-    // Turning past the beacon puts it on the OTHER side. turnSign has to
-    // follow the crossing, otherwise the next fix re-applies the stale side
-    // (bearingSigned = turnSign * theta) and silently undoes the overshoot --
-    // which reads as the robot refusing to correct back.
-    turnSign = (bearingSigned >= 0.0f) ? 1 : -1;
+    return proximityLatched;
 }
 
-// Rate-limited live readout of the current fix.  Shared by the running
-// debug stream and by monitor mode.
+static const char *dirName(Direction d)
+{
+    switch (d)
+    {
+    case DIR_FRONT:       return "FRONT";
+    case DIR_FRONT_RIGHT: return "FRONT-RIGHT";
+    case DIR_FRONT_LEFT:  return "FRONT-LEFT";
+    case DIR_RIGHT:       return "RIGHT";
+    case DIR_LEFT:        return "LEFT";
+    case DIR_BACK_RIGHT:  return "BACK-RIGHT";
+    case DIR_BACK_LEFT:   return "BACK-LEFT";
+    case DIR_BACK:        return "BACK";
+    default:              return "?";
+    }
+}
+
+// The whole "geometry": two comparisons, a margin, and a lookup.
+// Exact trilateration: solve the beacon's (x,y) in the robot frame from the
+// three ranges (x=forward, y=right), then bucket by a plain 45deg sector on
+// atan2(y,x). Unlike the far-field approximation this holds at any range —
+// verified numerically to zero error against known positions — but it is
+// still built from the same three noisy inputs, so the noise problem is
+// unchanged: only the packaging is different.
+static float lastTriAngle = 0.0f;
+
+static Direction classifyTrilateration()
+{
+    float dA = avgA, dB = avgB, dC = avgC;
+
+    float y = (dC * dC - dB * dB) / (4.0f * TRI_HALF);
+    float x = (2.0f * TRI_HA * TRI_HA - 2.0f * TRI_HALF * TRI_HALF -
+               2.0f * dA * dA + dB * dB + dC * dC) /
+              (4.0f * TRI_HA);
+
+    if (fbInvert)
+        x = -x;
+
+    float ang = atan2f(y, x) * 180.0f / PI; // + = right of forward
+    lastTriAngle = ang;
+
+    float a = fabs(ang);
+    if (a <= 22.5f)
+        return DIR_FRONT;
+    if (a <= 67.5f)
+        return (ang > 0) ? DIR_FRONT_RIGHT : DIR_FRONT_LEFT;
+    if (a <= 112.5f)
+        return (ang > 0) ? DIR_RIGHT : DIR_LEFT;
+    if (a <= 157.5f)
+        return (ang > 0) ? DIR_BACK_RIGHT : DIR_BACK_LEFT;
+    return DIR_BACK;
+}
+
+static Direction classify()
+{
+    lastWasTiebreak = false;
+
+    if (useTrilateration)
+        return classifyTrilateration();
+
+    float frontness = ((avgB + avgC) * 0.5f) - avgA; // + = A closer = ahead
+    if (fbInvert)
+        frontness = -frontness;
+
+    float rightness = avgC - avgB; // + = B closer = to the right
+
+    bool isFront = frontness > compareMargin;
+    bool isBack = frontness < -compareMargin;
+    bool isRight = rightness > compareMargin;
+    bool isLeft = rightness < -compareMargin;
+
+    if (isFront)
+    {
+        if (isRight)
+            return DIR_FRONT_RIGHT;
+        if (isLeft)
+            return DIR_FRONT_LEFT;
+        return DIR_FRONT;
+    }
+    if (isBack)
+    {
+        if (isRight)
+            return DIR_BACK_RIGHT;
+        if (isLeft)
+            return DIR_BACK_LEFT;
+        // Front/back is confident (frontness cleared the margin), but left/
+        // right didn't. That's not "no information" -- a real look at rightness
+        // does exist, just too small to trust as an independent direction. It IS
+        // trustworthy enough to break a tie: turning is going to happen either
+        // way (that's what isBack already decided), so leaning it toward
+        // whichever side the raw number already favours beats a fixed default.
+        // But it's still ONLY a lean, not confident evidence -- beginTurn()
+        // reads lastWasTiebreak and turns a small probe amount instead of the
+        // full commit, and the next look either confirms it or corrects it.
+        lastWasTiebreak = true;
+        return (rightness >= 0.0f) ? DIR_BACK_RIGHT : DIR_BACK_LEFT;
+    }
+    // Left/right is confident, front/back isn't. Same move as the BACK case
+    // above: lean the weak frontness reading toward FRONT-* or BACK-* instead
+    // of throwing it away for a flat RIGHT/LEFT -- and same caveat, it's a
+    // probe-sized turn until the next look confirms or corrects it.
+    if (isRight)
+    {
+        lastWasTiebreak = true;
+        return (frontness >= 0.0f) ? DIR_FRONT_RIGHT : DIR_BACK_RIGHT;
+    }
+    if (isLeft)
+    {
+        lastWasTiebreak = true;
+        return (frontness >= 0.0f) ? DIR_FRONT_LEFT : DIR_BACK_LEFT;
+    }
+
+    // Nothing cleared the margin on either axis. This used to return DIR_FRONT
+    // unconditionally — "can't tell, assume aligned, drive forward". That is
+    // only safe when the weak reading at least LEANS forward. If frontness is
+    // negative the beacon is behind, and driving forward actively increases
+    // the range: observed in a real log as the robot walking away from a
+    // stationary beacon sitting at 130-180 deg, cycle after cycle, because
+    // every reading landed just inside the margin.
+    //
+    // So: respect the sign even when the magnitude is not trustworthy. A weak
+    // forward lean still drives (worst case the beacon is off to a side and
+    // forward motion still closes distance). A weak backward lean turns
+    // instead — as a probe-sized step, since the evidence is weak.
+    if (frontness >= 0.0f)
+        return DIR_FRONT;
+
+    lastWasTiebreak = true;
+    return (rightness >= 0.0f) ? DIR_BACK_RIGHT : DIR_BACK_LEFT;
+}
+
 static void printLiveFix()
 {
     if (millis() - debugTimer < DEBUG_INTERVAL_MS)
         return;
     debugTimer = millis();
 
-    Serial.print("FOLLOW: A=");
-    Serial.print(filtA, 2);
-    Serial.print(" B=");
-    Serial.print(filtB, 2);
+    Serial.print("FOLLOW: raw=");
+    Serial.print(rawA, 2);
+    Serial.print("/");
+    Serial.print(rawB, 2);
+    Serial.print("/");
+    Serial.print(rawC, 2);
     Serial.print(" R=");
-    Serial.print(beaconRange, 2);
-    Serial.print(" theta=");
-    Serial.print(beaconTheta, 0);
-    Serial.print(" bearing=");
-    Serial.print(bearingSigned, 0);
-    Serial.print(" side=");
-    Serial.print(signConfidence == 0 ? "?" : (turnSign > 0 ? "R" : "L"));
-    Serial.print(" conf=");
-    Serial.print(signConfidence);
-    Serial.print(" state=");
+    Serial.print(avgRange, 2);
+    Serial.print(" dir=");
+    Serial.print(dirName(lastDir));
+    if (useTrilateration)
+    {
+        Serial.print(" ang=");
+        Serial.print(lastTriAngle, 0);
+    }
+    Serial.print(" st=");
     Serial.println((int)state);
 }
 
-static void beginSettle(bool judgeStep)
+static void beginMeasure()
 {
-    followMotion(0, 0);
-    settleStart = millis();
-    settleJudgesStep = judgeStep;
-    settleFilterCleared = false; // brake first, flush the filter after
-    state = FOLLOW_SETTLE;
+    motion(0);
+    measureStart = millis();
+    measureBraked = false;
+    accA = accB = accC = 0.0f;
+    accN = 0;
+    state = FOLLOW_MEASURE;
 }
 
-// A probe is a deliberate rotation taken purely to learn which side the beacon
-// is on.  It is the ONLY thing that stops the robot to measure, and it runs
-// only while signConfidence is 0 — normally once, at the start of a follow.
-static void beginProbe()
+static void beginTurn(Direction d)
 {
-    stepStartHeading = currentHeading;
-    stepSize = PROBE_STEP;
-
-    state = FOLLOW_TURN_STEP;
-
-    if (followDebug)
+    switch (d)
     {
-        Serial.print("FOLLOW: probing ");
-        Serial.print(turnSign > 0 ? "right " : "left ");
-        Serial.print(stepSize, 0);
-        Serial.print(" deg to find the side (theta=");
-        Serial.print(beaconTheta, 0);
-        Serial.println(")");
+    case DIR_FRONT_RIGHT:
+        turnSign = 1;
+        turnStepSize = TURN_NUDGE;
+        break;
+    case DIR_FRONT_LEFT:
+        turnSign = -1;
+        turnStepSize = TURN_NUDGE;
+        break;
+    case DIR_RIGHT:
+        turnSign = 1;
+        turnStepSize = TURN_SIDE;
+        break;
+    case DIR_LEFT:
+        turnSign = -1;
+        turnStepSize = TURN_SIDE;
+        break;
+    case DIR_BACK_RIGHT:
+        turnSign = 1;
+        turnStepSize = TURN_BACK;
+        break;
+    case DIR_BACK_LEFT:
+        turnSign = -1;
+        turnStepSize = TURN_BACK;
+        break;
+    case DIR_BACK:
+    default:
+        // Dead behind — no side information at all. Default to right; if the
+        // operator is not exactly behind next check, one of the L/R buckets
+        // will catch it and correct.
+        turnSign = 1;
+        turnStepSize = TURN_BACK;
+        break;
     }
+
+    // Weak (tiebreak) evidence only earns a probe-sized turn, not the full
+    // commit -- see the note on PROBE_STEP for why this needs no separate
+    // "was it right" check of its own.
+    if (lastWasTiebreak && turnStepSize > PROBE_STEP)
+        turnStepSize = PROBE_STEP;
+
+    turnStartHeading = currentHeading;
+    state = FOLLOW_TURN;
+    consecutiveTurns++;
+
+    if (consecutiveTurns == STUCK_TURN_WARNING)
+    {
+        Serial.println("FOLLOW: many turns without reaching FRONT — check followfb / followrev / followm");
+        consecutiveTurns = 0;
+    }
+
+    Serial.print("FOLLOW: ");
+    Serial.print(dirName(d));
+    Serial.print(lastWasTiebreak ? " (probe) -> turn " : " -> turn ");
+    Serial.print(turnSign > 0 ? "RIGHT " : "LEFT ");
+    Serial.print(turnStepSize, 0);
+    Serial.println(" deg");
 }
 
-// Enter the continuous drive state.  Everything is decided tick by tick from
-// there, so there is no longer a separate "turn" state in the normal path.
-static void chooseNextAction()
+static void beginLeg()
 {
-    if (beaconRange <= standoffRange)
-    {
-        followMotion(0, 0);
-        state = FOLLOW_HOLD;
-        Serial.print("FOLLOW: holding at ");
-        Serial.print(beaconRange, 2);
-        Serial.println(" m");
-        return;
-    }
-
+    legStartTravel = distance.odometryTravelled;
+    legStartRange = avgRange;
+    consecutiveTurns = 0;
+    driveSnapshotTimer = millis();
+    driveAccA = driveAccB = driveAccC = 0.0f;
+    driveAccN = 0;
     state = FOLLOW_DRIVE;
-    Serial.print("FOLLOW: driving (R=");
-    Serial.print(beaconRange, 2);
-    Serial.print(" m, theta=");
-    Serial.print(beaconTheta, 0);
-    Serial.println(")");
+
+    Serial.print("FOLLOW: drive — R=");
+    Serial.print(avgRange, 2);
+    Serial.print(" m, up to ");
+    Serial.print(legLength, 2);
+    Serial.println(" m");
 }
 
-// ─── Continuous control law ────────────────────────────
-//
-// Runs every tick off the fused bearing, so steering updates at loop rate
-// rather than once per beacon fix.  The ordering is the whole point:
-//
-//   aligned      -> drive straight
-//   modest error -> CURVE while still driving forward   (no stopping)
-//   large error  -> spin in place, but continuously, judged by the IMU
-//
-// The old code stopped, turned a step, stopped again and re-measured for every
-// single correction, which at 1 Hz is where the left-right-left shuffle came
-// from.  Here a spin ends the moment the dead-reckoned bearing falls inside
-// ALIGN_TOL, which the IMU knows at 100 Hz — no waiting for the next fix.
-static void steerToward()
+// Called once a stationary averaged fix is in hand.
+static void decide()
 {
-    float theta = fabs(bearingSigned);
-    int s = (bearingSigned >= 0.0f) ? 1 : -1;
-
-    if (theta <= ALIGN_TOL)
+    // Turn-only: range is irrelevant, so the stop/HOLD check is skipped
+    // entirely. Aim, then sit still and keep watching.
+    if (turnOnlyMode)
     {
-        // Aligned: motion(1)/motion(3) hold heading on the IMU PID.
-        if (beaconRange > standoffRange + CRUISE_MARGIN)
-            followMotion(1, 0);
+        Direction d = classify();
+        lastDir = d;
+
+        if (d == DIR_FRONT)
+        {
+            motion(0);
+            Serial.print("FOLLOW: aimed (R=");
+            Serial.print(avgRange, 2);
+            Serial.println(" m) — holding, turn-only mode");
+            beginMeasure(); // keep looking, so moving the beacon re-aims it
+        }
         else
-            followMotion(3, 0);
+        {
+            beginTurn(d);
+        }
         return;
     }
 
-    if (signConfidence > 0 && theta <= ARC_TOL)
+    if (avgRange <= stopRange + brakeLead())
     {
-        followMotion(arcCode(theta, s), s);
+        motion(0);
+        state = FOLLOW_HOLD;
+        accA = accB = accC = 0.0f;
+        accN = 0;
+        Serial.print("FOLLOW: stop — ");
+        Serial.print(avgRange, 2);
+        Serial.print(" m (limit ");
+        Serial.print(stopRange, 2);
+        Serial.println(" m)");
         return;
     }
 
-    // Too far off to fix on the move — rotate on the spot, but keep rotating
-    // rather than stepping and re-measuring.
-    followMotion(turnCode(theta, s), s);
+    Direction d = classify();
+    lastDir = d;
+
+    if (d == DIR_FRONT)
+        beginLeg();
+    else
+        beginTurn(d);
 }
 
 // ─── Measurement intake ────────────────────────────────
 
-// Pull the range out of one beacon's field, e.g. "A: TAG=3.13M  ".
-// The module reports "A=A: TAG=3.13M", so the number lives after the TAG=
-// label, not directly after "A=".  The bare form "A=3.35m" is still accepted
-// as a fallback.  toFloat() stops at the first non-numeric character, so the
-// trailing unit letter takes care of itself.
 static float parseRangeField(const String &s, int from, int to)
 {
     String field = s.substring(from, to);
@@ -408,9 +583,6 @@ static float parseRangeField(const String &s, int from, int to)
 
 bool Follow_IngestLine(const String &line)
 {
-    // Work on an uppercased copy so the field/label search is case-insensitive.
-    // toUpperCase() is 1:1 over ASCII, so indices still line up, and digits are
-    // unaffected by the conversion.
     String u = line;
     u.toUpperCase();
 
@@ -418,112 +590,54 @@ bool Follow_IngestLine(const String &line)
     if (ai < 0)
         return false;
 
-    // Search for B's field only after A's, so the "A" in "A=A:" can never be
-    // mistaken for the start of the B field (or vice versa).
     int bi = u.indexOf("B=", ai + 2);
     if (bi < 0)
         return false;
 
+    int ci = u.indexOf("C=", bi + 2);
+
     float a = parseRangeField(u, ai + 2, bi);
-    float b = parseRangeField(u, bi + 2, u.length());
+    float b = parseRangeField(u, bi + 2, (ci >= 0) ? ci : u.length());
+    float cc = (ci >= 0) ? parseRangeField(u, ci + 2, u.length()) : 0.0f;
 
-    // The line was addressed to us either way — a bad reading gets dropped
-    // here, not handed back to the command parser as a stray number.
-    if (a <= 0.05f || a > 50.0f || b <= 0.05f || b > 50.0f)
-        return true;
+    // Raw values are captured before any rejection: a reading too small to be a
+    // plausible range is still evidence the operator is close, and the guard
+    // that stops the robot must not be the thing that gets filtered out.
+    if (a > 0.0f && a < 50.0f)
+        rawA = a;
+    if (b > 0.0f && b < 50.0f)
+        rawB = b;
+    if (cc > 0.0f && cc < 50.0f)
+        rawC = cc;
 
-    // |A - B| can never exceed the baseline geometrically; anything past it
-    // is a multipath/dropout artefact, not a bearing.
-    if (fabs(a - b) > beaconBaseline * 1.6f)
-        return true;
+    if (a <= 0.05f || a > 50.0f || b <= 0.05f || b > 50.0f || cc <= 0.05f || cc > 50.0f)
+        return true; // addressed to us, just not a usable triple
 
-    if (sampleCount == 0)
-    {
-        filtA = a;
-        filtB = b;
-    }
-    else
-    {
-        filtA += FILTER_ALPHA * (a - filtA);
-        filtB += FILTER_ALPHA * (b - filtB);
-    }
-
-    if (sampleCount < 1000)
-        sampleCount++;
     lastSampleMs = millis();
 
-    // Solve the triangle (see the geometry note at the top of this file).
-    float halfD = beaconBaseline * 0.5f;
-    float r2 = (filtA * filtA + filtB * filtB) * 0.5f - halfD * halfD;
-    if (r2 < 0.0001f)
-        r2 = 0.0001f;
-
-    beaconRange = sqrtf(r2);
-
-    float c = (filtB * filtB - filtA * filtA) / (2.0f * beaconRange * beaconBaseline);
-    c = constrain(c, -1.0f, 1.0f);
-    beaconTheta = acosf(c) * 180.0f / PI;
-
-    // ── Infer which side the beacon is on ──
-    // Only a rotation carries information: standing still, both hypotheses
-    // predict the same next reading and the test is silent by construction.
-    if (haveLastFix && fabs(rotSinceFix) >= SIGN_MIN_ROT)
+    // The real, stationary average used for actual turn/drive decisions: only
+    // accumulated while genuinely stopped, never mid-turn -- rotating changes
+    // the robot's heading between samples, which would blend readings taken
+    // at different orientations into one meaningless average.
+    if ((state == FOLLOW_MEASURE && measureBraked) || state == FOLLOW_HOLD)
     {
-        float predRight = fabs(thetaAtLastFix - rotSinceFix);
-        float predLeft = fabs(thetaAtLastFix + rotSinceFix);
-
-        float errRight = fabs(beaconTheta - predRight);
-        float errLeft = fabs(beaconTheta - predLeft);
-
-        int evidence = 0;
-        if (errRight < errLeft - SIGN_MARGIN_DEG)
-            evidence = 1;
-        else if (errLeft < errRight - SIGN_MARGIN_DEG)
-            evidence = -1;
-
-        if (evidence != 0)
-        {
-            if (signConfidence == 0)
-            {
-                turnSign = evidence;
-                signConfidence = 1;
-                if (followDebug)
-                {
-                    Serial.print("FOLLOW: side = ");
-                    Serial.println(turnSign > 0 ? "RIGHT" : "LEFT");
-                }
-            }
-            else if (evidence == turnSign)
-            {
-                // Agreeing evidence buys confidence, capped — so a locked-in
-                // side survives the occasional bad fix instead of reversing.
-                if (signConfidence < SIGN_CONF_MAX)
-                    signConfidence++;
-            }
-            else
-            {
-                signConfidence--;
-                if (signConfidence <= 0)
-                {
-                    turnSign = evidence;
-                    signConfidence = 1;
-                    if (followDebug)
-                    {
-                        Serial.print("FOLLOW: side flipped to ");
-                        Serial.println(turnSign > 0 ? "RIGHT" : "LEFT");
-                    }
-                }
-            }
-        }
+        accA += a;
+        accB += b;
+        accC += cc;
+        accN++;
     }
 
-    // Re-anchor the tracked bearing on the measurement: the sensor owns the
-    // magnitude, the inference owns the sign, and trackRotation() carries it
-    // forward between fixes.
-    bearingSigned = turnSign * beaconTheta;
-    thetaAtLastFix = beaconTheta;
-    rotSinceFix = 0.0f;
-    haveLastFix = true;
+    // A separate, looser accumulator for the live check while DRIVING a leg.
+    // Driving straight doesn't rotate the robot, so samples taken mid-leg are
+    // not smeared across headings the way mid-turn ones would be -- safe to
+    // collect without stopping.
+    if (state == FOLLOW_DRIVE)
+    {
+        driveAccA += a;
+        driveAccB += b;
+        driveAccC += cc;
+        driveAccN++;
+    }
 
     return true;
 }
@@ -533,10 +647,9 @@ bool Follow_IngestLine(const String &line)
 void Follow_Init()
 {
     state = FOLLOW_OFF;
-    resetFilter();
-    resetTracking();
     lastSampleMs = 0;
-    turnSign = 1;
+    rawA = rawB = rawC = 0.0f;
+    proximityLatched = false;
 }
 
 bool Follow_IsRunning()
@@ -558,10 +671,10 @@ void Follow_Start()
     Drive_Cancel();
     Navigation_Cancel();
 
-    resetFilter();
-    resetTracking();
+    proximityLatched = false;
     camStopReported = false;
-    state = FOLLOW_ACQUIRE;
+    consecutiveTurns = 0;
+    beginMeasure();
 
     Serial.println("FOLLOW: --- FOLLOW-ME ARMED --- waiting for beacon data");
     Follow_PrintConfig();
@@ -572,10 +685,9 @@ void Follow_Cancel()
     if (state == FOLLOW_OFF)
         return;
 
-    followMotion(0, 0);
+    motion(0);
     state = FOLLOW_OFF;
-    resetFilter();
-    resetTracking();
+    proximityLatched = false;
 }
 
 void Follow_Stop()
@@ -592,29 +704,252 @@ void Follow_Stop()
 
 void Follow_PrintConfig()
 {
-    Serial.print("FOLLOW: baseline d=");
-    Serial.print(beaconBaseline, 2);
-    Serial.print(" m | standoff=");
-    Serial.print(standoffRange, 2);
-    Serial.print(" m | resume=");
-    Serial.print(standoffRange + RANGE_HYSTERESIS, 2);
-    Serial.print(" m | data ");
-    if (dataValid())
+    Serial.print("FOLLOW: stop<");
+    Serial.print(stopRange, 2);
+    Serial.print(" resume>");
+    Serial.print(resumeRange, 2);
+    Serial.print(" anchor<");
+    Serial.print(proximityStopRange, 2);
+    Serial.print(" | margin ");
+    Serial.print(compareMargin, 2);
+    Serial.print(" m | leg ");
+    Serial.print(legLength, 2);
+    Serial.print(" m | turns ");
+    Serial.print(turnInvert ? "INVERTED" : "normal");
+    Serial.print(" | front/back ");
+    Serial.print(fbInvert ? "INVERTED" : "normal");
+    Serial.print(" | method ");
+    Serial.print(useTrilateration ? "TRILATERATION" : "THRESHOLD");
+    Serial.println(turnOnlyMode ? " | TURN-ONLY (will not drive)" : "");
+}
+
+// ─── Update ────────────────────────────────────────────
+
+void Follow_Update()
+{
+    if (state == FOLLOW_OFF)
     {
-        Serial.print("A=");
-        Serial.print(filtA, 2);
-        Serial.print(" B=");
-        Serial.print(filtB, 2);
-        Serial.print(" R=");
-        Serial.print(beaconRange, 2);
-        Serial.print(" theta=");
-        Serial.println(beaconTheta, 0);
+        if (followMonitor && (lastSampleMs != 0) &&
+            (millis() - lastSampleMs <= DATA_TIMEOUT_MS))
+            printLiveFix();
+        return;
     }
-    else
+
+    // Pause ('p', or a camera pause) must freeze follow-me too.  Drive_Update()
+    // already forces motion(0) every tick while paused and runs BEFORE this, so
+    // without freezing here the command issued below would overwrite that stop
+    // on the same tick and the robot would keep going.
+    if (Drive_IsPaused())
     {
-        Serial.println("(none yet)");
+        motion(0);
+        return;
+    }
+
+    // Beacon link lost: stop and wait, never coast blind.
+    if ((lastSampleMs == 0) || (millis() - lastSampleMs > DATA_TIMEOUT_MS))
+    {
+        motion(0);
+        if (state != FOLLOW_MEASURE)
+        {
+            Serial.println("FOLLOW: beacon data lost — stopping");
+            beginMeasure();
+        }
+        return;
+    }
+
+    // Hard proximity stop, ahead of everything else.
+    // Skipped in turn-only mode: it exists to stop the robot DRIVING into the
+    // operator, and turn-only never drives. Left active it would latch HOLD
+    // whenever you stood close and the robot would stop aiming — the one thing
+    // this mode is for.
+    if (!turnOnlyMode && proximityBlocked())
+    {
+        motion(0);
+        if (state != FOLLOW_HOLD)
+        {
+            float nr = (rawA < rawB) ? rawA : rawB;
+            if (rawC > 0.0f && rawC < nr)
+                nr = rawC;
+            Serial.print("FOLLOW: proximity stop — anchor ");
+            Serial.print(nr, 2);
+            Serial.println(" m");
+            state = FOLLOW_HOLD;
+            accA = accB = accC = 0.0f;
+            accN = 0;
+        }
+        return;
+    }
+
+    if (followDebug)
+        printLiveFix();
+
+    switch (state)
+    {
+    // ── MEASURE: stopped, averaging ──
+    case FOLLOW_MEASURE:
+    {
+        motion(0);
+
+        // Let the PWM ramp-down finish before counting anything — readings
+        // taken while still coasting are not stationary readings.
+        if (!measureBraked)
+        {
+            if (millis() - measureStart < BRAKE_MS)
+                break;
+            measureBraked = true;
+            measureStart = millis();
+            accA = accB = accC = 0.0f;
+            accN = 0;
+            break;
+        }
+
+        if (accN < MEASURE_SAMPLES)
+        {
+            if (millis() - measureStart > MEASURE_TIMEOUT_MS && accN >= 2)
+            {
+                Serial.print("FOLLOW: measure timed out, using ");
+                Serial.print(accN);
+                Serial.println(" samples");
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        avgA = accA / accN;
+        avgB = accB / accN;
+        avgC = accC / accN;
+        avgRange = (avgA + avgB + avgC) / 3.0f;
+
+        decide();
+        break;
+    }
+
+    // ── TURN: rotate the fixed amount for the current bucket ──
+    case FOLLOW_TURN:
+    {
+        float turned = fabs(normalizeAngle(currentHeading - turnStartHeading));
+        float remaining = turnStepSize - turned;
+
+        if (remaining <= 0.0f)
+        {
+            motion(0);
+            beginMeasure(); // always re-measure after a turn, never assume
+        }
+        else
+        {
+            motion(turnCode(remaining, turnSign));
+        }
+        break;
+    }
+
+    // ── DRIVE: one leg, roughly toward the beacon ──
+    case FOLLOW_DRIVE:
+    {
+        // The front camera keeps its veto on forward motion.
+        if (!camBypass && frontCamLocked)
+        {
+            motion(0);
+            if (!camStopReported)
+            {
+                camStopReported = true;
+                Serial.println("FOLLOW: front camera blocked — waiting");
+            }
+            break;
+        }
+        camStopReported = false;
+
+        // Live check without stopping: every DRIVE_SNAPSHOT_MS, look at
+        // whatever raw samples arrived since the last check. If they say the
+        // beacon has clearly moved off-course (not just routine noise around
+        // "still roughly ahead"), stop driving now and get a proper stationary
+        // read instead of blindly finishing the rest of the leg.
+        if (millis() - driveSnapshotTimer >= DRIVE_SNAPSHOT_MS)
+        {
+            driveSnapshotTimer = millis();
+
+            if (driveAccN >= DRIVE_SNAPSHOT_SAMPLES)
+            {
+                float A = driveAccA / driveAccN;
+                float B = driveAccB / driveAccN;
+                float C = driveAccC / driveAccN;
+
+                float front = ((B + C) * 0.5f) - A;
+                if (fbInvert)
+                    front = -front;
+                float right = C - B;
+
+                if (front < -DRIVE_CHECK_MARGIN || fabs(right) > DRIVE_CHECK_MARGIN)
+                {
+                    Serial.println("FOLLOW: drifted off course while driving — stopping to look");
+                    beginMeasure();
+                    break;
+                }
+            }
+
+            driveAccA = driveAccB = driveAccC = 0.0f;
+            driveAccN = 0;
+        }
+
+        float travelled = fabs(distance.odometryTravelled - legStartTravel);
+
+        // Stop the leg early if driving straight has already closed enough
+        // distance — waiting for the full leg to finish is what let the robot
+        // overshoot stopRange before it ever re-measured. This is a lower
+        // bound on the true range (real closure rate is at most this, since
+        // the bearing may not be perfectly zero), so it can only make the
+        // robot stop too early, never too late.
+        float estRange = legStartRange - travelled;
+        if (estRange <= stopRange + brakeLead())
+        {
+            beginMeasure();
+            break;
+        }
+
+        if (travelled >= legLength)
+        {
+            beginMeasure();
+            break;
+        }
+
+        motion(3); // slow, heading-held straight line
+        break;
+    }
+
+    // ── HOLD: close enough — stay put until they walk away ──
+    case FOLLOW_HOLD:
+    {
+        motion(0);
+
+        // Keep taking fresh stationary readings while parked, or the robot
+        // would never notice the operator walking away.
+        if (accN >= MEASURE_SAMPLES)
+        {
+            avgA = accA / accN;
+            avgB = accB / accN;
+            avgC = accC / accN;
+            avgRange = (avgA + avgB + avgC) / 3.0f;
+            accA = accB = accC = 0.0f;
+            accN = 0;
+
+            if (avgRange > resumeRange)
+            {
+                Serial.print("FOLLOW: beacon at ");
+                Serial.print(avgRange, 2);
+                Serial.println(" m — following again");
+                beginMeasure();
+            }
+        }
+        break;
+    }
+
+    default:
+        break;
     }
 }
+
+// ─── Commands ──────────────────────────────────────────
 
 bool Follow_HandleCommand(const String &line)
 {
@@ -653,23 +988,77 @@ bool Follow_HandleCommand(const String &line)
         return true;
     }
 
+    if (line.equalsIgnoreCase("followrev"))
+    {
+        turnInvert = !turnInvert;
+        Serial.print("FOLLOW: turn direction ");
+        Serial.println(turnInvert ? "INVERTED" : "normal");
+        return true;
+    }
+
+    if (line.equalsIgnoreCase("followfb"))
+    {
+        fbInvert = !fbInvert;
+        Serial.print("FOLLOW: front/back sense ");
+        Serial.println(fbInvert ? "INVERTED" : "normal");
+        return true;
+    }
+
+    if (line.equalsIgnoreCase("followturn"))
+    {
+        turnOnlyMode = !turnOnlyMode;
+        Serial.print("FOLLOW: TURN-ONLY mode ");
+        Serial.println(turnOnlyMode ? "ON — will aim at the beacon and hold, never drive"
+                                    : "OFF — normal follow (turn and drive)");
+        return true;
+    }
+
+    if (line.equalsIgnoreCase("followtri"))
+    {
+        useTrilateration = !useTrilateration;
+        Serial.print("FOLLOW: direction method = ");
+        Serial.println(useTrilateration ? "TRILATERATION (45deg sectors)" : "THRESHOLD (margin comparisons)");
+        return true;
+    }
+
     String upper = line;
     upper.toUpperCase();
 
-    if (upper.startsWith("FOLLOWD "))
+    if (upper.startsWith("FOLLOWM "))
     {
         float v = line.substring(8).toFloat();
-        if (v >= 0.05f && v <= 5.0f)
+        // Capped at 0.21, not an arbitrary limit: past 0.216 there are angles
+        // where neither frontness nor rightness can physically reach the
+        // margin (their ceilings are only 0.311 and 0.300), and the beacon
+        // goes invisible in a cone around +-135 deg. See the note on
+        // compareMargin.
+        if (v >= 0.03f && v <= 0.21f)
         {
-            beaconBaseline = v;
-            resetFilter();
-            Serial.print("FOLLOW: baseline set to ");
-            Serial.print(beaconBaseline, 2);
+            compareMargin = v;
+            Serial.print("FOLLOW: compare margin set to ");
+            Serial.print(compareMargin, 2);
             Serial.println(" m");
         }
         else
         {
-            Serial.println("FOLLOW: baseline must be 0.05-5.00 m");
+            Serial.println("FOLLOW: margin must be 0.03-0.21 m (above 0.216 opens a blind cone at +/-135 deg)");
+        }
+        return true;
+    }
+
+    if (upper.startsWith("FOLLOWL "))
+    {
+        float v = line.substring(8).toFloat();
+        if (v >= 0.30f && v <= 5.0f)
+        {
+            legLength = v;
+            Serial.print("FOLLOW: leg length set to ");
+            Serial.print(legLength, 2);
+            Serial.println(" m");
+        }
+        else
+        {
+            Serial.println("FOLLOW: leg must be 0.30-5.00 m");
         }
         return true;
     }
@@ -679,231 +1068,59 @@ bool Follow_HandleCommand(const String &line)
         float v = line.substring(8).toFloat();
         if (v >= 0.20f && v <= 10.0f)
         {
-            standoffRange = v;
-            Serial.print("FOLLOW: standoff set to ");
-            Serial.print(standoffRange, 2);
+            stopRange = v;
+            if (resumeRange < stopRange + 0.2f)
+            {
+                resumeRange = stopRange + 0.2f;
+                Serial.print("FOLLOW: resume raised to ");
+                Serial.print(resumeRange, 2);
+                Serial.println(" m to keep a margin");
+            }
+            Serial.print("FOLLOW: stop range set to ");
+            Serial.print(stopRange, 2);
             Serial.println(" m");
         }
         else
         {
-            Serial.println("FOLLOW: standoff must be 0.20-10.00 m");
+            Serial.println("FOLLOW: stop range must be 0.20-10.00 m");
+        }
+        return true;
+    }
+
+    if (upper.startsWith("FOLLOWG "))
+    {
+        float v = line.substring(8).toFloat();
+        if (v >= stopRange + 0.1f && v <= 20.0f)
+        {
+            resumeRange = v;
+            Serial.print("FOLLOW: resume range set to ");
+            Serial.print(resumeRange, 2);
+            Serial.println(" m");
+        }
+        else
+        {
+            Serial.println("FOLLOW: resume must be at least stop+0.10 m");
+        }
+        return true;
+    }
+
+    if (upper.startsWith("FOLLOWP "))
+    {
+        float v = line.substring(8).toFloat();
+        if (v >= 0.20f && v <= 5.0f)
+        {
+            proximityStopRange = v;
+            proximityLatched = false;
+            Serial.print("FOLLOW: anchor stop set to ");
+            Serial.print(proximityStopRange, 2);
+            Serial.println(" m");
+        }
+        else
+        {
+            Serial.println("FOLLOW: anchor stop must be 0.20-5.00 m");
         }
         return true;
     }
 
     return false;
-}
-
-// ─── Update (called every loop tick) ───────────────────
-
-void Follow_Update()
-{
-    if (state == FOLLOW_OFF)
-    {
-        // Monitor mode: live bearing readout with the motors provably idle,
-        // because nothing below this point ever runs.  This is how you check
-        // that A and B are not swapped before letting the robot drive.
-        if (followMonitor && dataValid() &&
-            (lastSampleMs != 0) && (millis() - lastSampleMs <= DATA_TIMEOUT_MS))
-            printLiveFix();
-        return;
-    }
-
-    // ── Pause ('p', or a camera pause) must stop follow-me too ──
-    // Drive_Update() already forces motion(0) every tick while paused, but it
-    // runs BEFORE Follow_Update() in loop(), so without this the follow-me
-    // drive command issued here would simply overwrite that stop on the same
-    // tick and the robot would keep going. Freezing here instead leaves the
-    // state machine intact, so resuming picks up mid-step rather than
-    // restarting the approach.
-    if (Drive_IsPaused())
-    {
-        followMotion(0, 0);
-        return;
-    }
-
-    // ── Beacon link lost: stop and wait, never coast blind ──
-    bool stale = (lastSampleMs == 0) || (millis() - lastSampleMs > DATA_TIMEOUT_MS);
-    if (stale)
-    {
-        followMotion(0, 0);
-        if (state != FOLLOW_ACQUIRE)
-        {
-            Serial.println("FOLLOW: beacon data lost — stopping");
-            resetFilter();
-            state = FOLLOW_ACQUIRE;
-        }
-        return;
-    }
-
-    // Filter still refilling (fresh start, or flushed for a settle) — hold.
-    if (!dataValid())
-    {
-        followMotion(0, 0);
-        return;
-    }
-
-    // Carry the bearing forward through the robot's own rotation before any
-    // decision is taken from it.
-    trackRotation();
-
-    // ── Periodic debug ──
-    if (followDebug)
-        printLiveFix();
-
-    switch (state)
-    {
-    // ── ACQUIRE: first usable fix — decide what to do with it ──
-    case FOLLOW_ACQUIRE:
-    {
-        Serial.print("FOLLOW: beacon acquired (R=");
-        Serial.print(beaconRange, 2);
-        Serial.print(" m, theta=");
-        Serial.print(beaconTheta, 0);
-        Serial.println(" deg)");
-
-        // A bearing magnitude alone cannot say left from right. If the side is
-        // not yet known, earn it once with a probe; otherwise go straight to
-        // driving and never stop to measure again.
-        if (signConfidence == 0 && beaconTheta > ALIGN_TOL)
-            beginProbe();
-        else
-            chooseNextAction();
-        break;
-    }
-
-    // ── PROBE: rotate a known amount so the side test has something to read ──
-    // Reached only while the side is unknown.  The evidence itself is gathered
-    // in Follow_IngestLine as fixes arrive, so there is nothing to judge here.
-    case FOLLOW_TURN_STEP:
-    {
-        float turned = fabs(normalizeAngle(currentHeading - stepStartHeading));
-        float remaining = stepSize - turned;
-
-        if (remaining <= 0.0f)
-        {
-            followMotion(0, 0);
-            beginSettle(true);
-        }
-        else
-        {
-            followMotion(turnCode(remaining, turnSign), turnSign);
-        }
-        break;
-    }
-
-    // ── SETTLE: motors off, clean stationary readings, then commit ──
-    // A rotating robot smears the range EMA, so the probe's verdict is taken
-    // from readings captured while genuinely stopped.  This is the only place
-    // follow-me waits, and it is skipped entirely once the side is known.
-    case FOLLOW_SETTLE:
-    {
-        followMotion(0, 0);
-
-        // Phase 1: let the PWM ramp-down finish before trusting anything.
-        if (!settleFilterCleared)
-        {
-            if (millis() - settleStart < BRAKE_MS)
-                break;
-
-            resetFilter(); // only readings taken while genuinely stopped count
-            settleFilterCleared = true;
-            settleStart = millis(); // restart the clock for the sampling window
-            break;
-        }
-
-        // Phase 2: wait for a full window of stationary readings.
-        if ((millis() - settleStart < SETTLE_MS) || (sampleCount < SETTLE_SAMPLES))
-            break;
-
-        if (settleJudgesStep && signConfidence == 0)
-        {
-            // The probe rotated but the two hypotheses still predict readings
-            // too close to separate — usually the beacon is near dead ahead or
-            // dead astern, where the geometry is genuinely least informative.
-            // Probe again the other way rather than committing to a guess.
-            turnSign = -turnSign;
-            Serial.println("FOLLOW: side still unclear — probing the other way");
-            beginProbe();
-            break;
-        }
-
-        chooseNextAction();
-        break;
-    }
-
-    // ── DRIVE: aligned — close on the beacon ──
-    case FOLLOW_DRIVE:
-    {
-        // The front camera keeps its veto on forward motion.
-        if (!camBypass && frontCamLocked)
-        {
-            followMotion(0, 0);
-            if (!camStopReported)
-            {
-                camStopReported = true;
-                Serial.println("FOLLOW: front camera blocked — waiting");
-            }
-            break;
-        }
-        camStopReported = false;
-
-        if (beaconRange <= standoffRange)
-        {
-            followMotion(0, 0);
-            state = FOLLOW_HOLD;
-            Serial.print("FOLLOW: reached standoff (");
-            Serial.print(beaconRange, 2);
-            Serial.println(" m) — holding");
-            break;
-        }
-
-        // Lost the side (a flip spent the last confidence point) — the only
-        // thing worth stopping for.  Everything else is handled on the move.
-        if (signConfidence == 0 && fabs(bearingSigned) > ALIGN_TOL)
-        {
-            Serial.println("FOLLOW: side lost — re-probing");
-            beginProbe();
-            break;
-        }
-
-        // Steer continuously: straight, curve, or spin, decided from the
-        // IMU-tracked bearing every tick.  No stopping to re-measure.
-        steerToward();
-        break;
-    }
-
-    // ── HOLD: inside the standoff — stay put, stay facing the beacon ──
-    case FOLLOW_HOLD:
-    {
-        if (beaconRange >= standoffRange + RANGE_HYSTERESIS)
-        {
-            Serial.println("FOLLOW: beacon moving away — resuming");
-            chooseNextAction();
-            break;
-        }
-
-        if (fabs(bearingSigned) >= REALIGN_TOL)
-        {
-            if (signConfidence == 0)
-            {
-                Serial.println("FOLLOW: re-facing beacon — side unknown, probing");
-                beginProbe();
-                break;
-            }
-
-            // Stopped and confident: rotate on the spot until the tracked
-            // bearing comes back inside tolerance.
-            int s = (bearingSigned >= 0.0f) ? 1 : -1;
-            followMotion(turnCode(fabs(bearingSigned), s), s);
-            break;
-        }
-
-        followMotion(0, 0);
-        break;
-    }
-
-    default:
-        break;
-    }
 }
