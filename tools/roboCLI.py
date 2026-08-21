@@ -22,6 +22,12 @@ Commands:
     debug       => Toggle live X / Y / heading stream (every 200 ms)
     1 / 15 / 0  => Sends the numeric command as-is
     m / s       => Sends the single-char Teensy command
+    follow      => FOLLOW-ME: robot autonomously follows the beacon you carry
+    followstop  => Stop follow-me
+    followmon   => Toggle live beacon readout with motors idle (safe bring-up)
+    followcfg   => Print follow-me configuration + current beacon fix
+    followd <m> => Set A<->B anchor spacing in metres (default 0.545)
+    followr <m> => Set standoff: how far in front of you it stops (default 1.20)
     p           => Toggle drive PAUSE / RESUME
                    First 'p'  => pauses (motors stop, task frozen)
                    Second 'p' => resumes (motors restart, task continues)
@@ -189,6 +195,12 @@ def main():
                     # Cancel any running autonomous track, then stop manual motors
                     ser.write(b"T:S\n")   # abort drive task queue on Teensy
                     time.sleep(0.05)
+                    # Follow-me drives motion() directly and ignores manual
+                    # data while running, so neither "T:S" nor "0" below can
+                    # stop it -- it needs its own cancel or the latch would
+                    # engage while the firmware kept commanding motion.
+                    ser.write(b"followstop\n")
+                    time.sleep(0.05)
                     ser.write(b"0\n")     # zero manual motor command
                     robot_locked = True
                 else:
@@ -260,6 +272,47 @@ def main():
                     debug_on = not debug_on
                     status = "ON" if debug_on else "OFF"
                     print("  -> d  (live odometry stream " + status + ")")
+                continue
+
+            # ---- Follow-me ----
+            # followmon/followcfg/followdbg are read-only, so they stay
+            # available even while latched -- being able to look at the beacon
+            # fix without arming the motors is the whole point of monitor mode.
+            if lower in ("followmon", "followcfg", "followdbg"):
+                ser.write((lower + "\n").encode("utf-8"))
+                print("  -> " + lower)
+                continue
+
+            if lower in ("follow", "followme"):
+                if robot_locked:
+                    print("  ! EMERGENCY LATCHED -- follow blocked. Unlock with x first.")
+                else:
+                    # Quieten the odometry stream first; follow-me prints its
+                    # own fix line and the two interleave badly.
+                    if debug_on:
+                        ser.write(b"d\n")
+                        debug_on = False
+                        print("  [debug stream paused for follow-me]")
+                    ser.write(b"follow\n")
+                    # Follow_Start() calls Drive_Cancel() on the Teensy, which
+                    # clears the pause latch -- mirror that here so this CLI's
+                    # idea of the pause state does not go stale.
+                    drive_paused = False
+                    print("  -> follow  (FOLLOW-ME ARMED)")
+                    print("     Robot turns to face the beacon, then drives at it.")
+                    print("     Stop with 'followstop', 'p', or 'x'.")
+                continue
+
+            if lower == "followstop":
+                ser.write(b"followstop\n")
+                print("  -> followstop")
+                continue
+
+            # followd <m> / followr <m>  -- anchor spacing / standoff range
+            m_follow = re.match(r"^(followd|followr)\s+([0-9]*\.?[0-9]+)$", lower)
+            if m_follow:
+                ser.write((m_follow.group(1) + " " + m_follow.group(2) + "\n").encode("utf-8"))
+                print("  -> " + m_follow.group(1) + " " + m_follow.group(2))
                 continue
 
             # ---- Repeat last track ----

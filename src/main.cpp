@@ -12,6 +12,7 @@
 #include "odometry.h"
 #include "drive.h"
 #include "navigation.h"
+#include "follow.h"
 
 int SLAVE_ADDRESS = 0x72;
 
@@ -160,6 +161,7 @@ void setup()
   Odometry_Init();
   Drive_Init();
   Navigation_Init();
+  Follow_Init();
 
   Serial5.write(0);
   Serial5.write(192);
@@ -208,8 +210,27 @@ void loop()
       String fullLine = String((char)_data) + rest;
       fullLine.trim();
 
+      // Echo everything that arrives on USB serial, so incoming data is
+      // visible even when no command below recognises it.
+      Serial.print("RX[");
+      Serial.print(fullLine.length());
+      Serial.print("]: ");
+      Serial.println(fullLine);
+
+      // ── Beacon ranges: "A=2.69M B=2.36M" ──
+      // Must be checked before the numeric fallthrough at the bottom, where
+      // toInt() would turn the whole line into a silent motion(0).
+      if (Follow_IngestLine(fullLine))
+      {
+        // consumed — beacon data, not a command
+      }
+      // ── Follow-me commands: follow / followstop / followmon / ... ──
+      else if (Follow_HandleCommand(fullLine))
+      {
+        data = 0;
+      }
       // ── Task command: "T:..." ──
-      if (fullLine.startsWith("T:") || fullLine.startsWith("t:"))
+      else if (fullLine.startsWith("T:") || fullLine.startsWith("t:"))
       {
         Drive_ParseTask(fullLine);
         data = 0;
@@ -282,7 +303,7 @@ void loop()
   // Control-counter timeout: only when NOT in autonomous drive
   if (elaspedTimeControlCounter > timeConstantControlCounter)
   {
-    if (!Drive_IsRunning() && !Navigation_IsRunning())
+    if (!Drive_IsRunning() && !Navigation_IsRunning() && !Follow_IsRunning())
     {
       data = 0; // Commenting for Testing //TODO:
     }
@@ -306,6 +327,7 @@ void loop()
     {
       Drive_Cancel();
       Navigation_Cancel();
+      Follow_Cancel();
       emergencyAlter = false;
     }
   }
@@ -316,7 +338,7 @@ void loop()
     // ── Autonomous mode: suppress manual control ──
     // Navigation_IsRunning() covers pursuit/parking (navigation calls motion()
     // directly).  Drive_IsRunning() covers queued commands (drive calls motion()).
-    if (Drive_IsRunning() || Navigation_IsRunning())
+    if (Drive_IsRunning() || Navigation_IsRunning() || Follow_IsRunning())
     {
       static unsigned long navFrontLockTime = 0;
       static unsigned long navBackLockTime = 0;
@@ -564,20 +586,20 @@ void loop()
 
       // Serial.println(" rad/s");
 
-      Serial.print(" D=");
-      Serial.print(distance.travelled, 3);
+      // Serial.print(" D=");
+      // Serial.print(distance.travelled, 3);
 
-      Serial.print(" OD=");
-      Serial.print(distance.odometryTravelled, 3);
+      // Serial.print(" OD=");
+      // Serial.print(distance.odometryTravelled, 3);
 
-      Serial.print(" | X=");
-      Serial.print(odometry.x, 3);
+      // Serial.print(" | X=");
+      // Serial.print(odometry.x, 3);
 
-      Serial.print(" | Y=");
-      Serial.print(odometry.y, 3);
+      // Serial.print(" | Y=");
+      // Serial.print(odometry.y, 3);
 
-      Serial.print(" | H=");
-      Serial.println(odometry.heading, 3);
+      // Serial.print(" | H=");
+      // Serial.println(odometry.heading, 3);
       
 
       // Serial.println(" rad");
@@ -643,4 +665,9 @@ void loop()
 
   // Autonomous drive — runs every loop() cycle for tight heading control
   Drive_Update();
+
+  // Follow-me — MUST run after Drive_Update(): while paused Drive_Update()
+  // forces motion(0) every tick, and Follow_Update() checks Drive_IsPaused()
+  // itself so it freezes rather than overwriting that stop on the same tick.
+  Follow_Update();
 }
