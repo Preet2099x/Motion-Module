@@ -55,9 +55,6 @@
 
 // ─── Tuning ────────────────────────────────────────────
 
-static float stopRange = 2.00f;   // m — average range below this: stop
-static float resumeRange = 2.30f; // m — average range above this: follow again
-
 // Noise margin for the front/back and left/right comparisons. A difference
 // smaller than this is treated as "can't tell" rather than acted on — the
 // single biggest defence against dithering on sensor noise.
@@ -103,9 +100,6 @@ static const float TURN_BACK = 110.0f; // deg — BACK-LEFT / BACK-RIGHT / BACK
 // every-time design does the verify-or-abandon step for free.
 static const float PROBE_STEP = 12.0f; // deg
 
-// How far to drive before stopping to look again.
-static float legLength = 1.00f; // m — max distance driven before stopping to recompute
-
 // Hard proximity stop on the RAW per-anchor ranges — no averaging, no
 // geometry. If any single anchor reads under this, stop immediately.
 static float proximityStopRange = 0.70f;
@@ -114,8 +108,6 @@ static const float PROXIMITY_RELEASE = 0.30f; // m — extra before resuming
 static const int MEASURE_SAMPLES = 4;
 static const unsigned long BRAKE_MS = 400; // motion(0) coast before trusting a sample
 static const unsigned long MEASURE_TIMEOUT_MS = 9000;
-
-static const float COAST_S = 0.35f; // motion(0) ramp-down before it truly stops
 
 static const unsigned long DATA_TIMEOUT_MS = 3500;
 static const unsigned long DEBUG_INTERVAL_MS = 700;
@@ -132,8 +124,7 @@ enum FollowState
     FOLLOW_OFF,
     FOLLOW_MEASURE, // stopped, averaging a clean fix
     FOLLOW_TURN,    // rotating a fixed amount for the current bucket
-    FOLLOW_DRIVE,   // driving one leg, roughly toward the beacon
-    FOLLOW_HOLD     // close enough — stopped until they walk away
+    FOLLOW_HOLD     // latched by the proximity stop; resumes when it clears
 };
 
 enum Direction
@@ -164,13 +155,12 @@ static bool fbInvert = false;   // flips which way frontness is read
 // A/B test (`followtri`) because simulation is a model, not the real robot.
 static bool useTrilateration = false;
 
-// TURN-ONLY mode: aim at the beacon and stop. Never drives, never closes
-// distance, never stops on range. This isolates the direction logic from
-// everything else — if the robot ends up facing you and holds still, the
-// classification is right and any remaining problem is in the driving; if it
-// faces the wrong way, the problem is upstream of driving entirely.
-// Once aimed it keeps re-measuring, so moving the beacon makes it re-aim.
-static bool turnOnlyMode = false;
+// This build does not drive. AT ALL. `follow` aims at the beacon and holds,
+// and there is no state, flag or command that can make it translate — the
+// drive state, the leg machinery and beginLeg() are gone from the file
+// rather than merely disabled, so there is no path to reintroduce motion by
+// getting a toggle wrong. Only motion(0) and the in-place turn codes are
+// ever issued.
 
 // A's forward offset from the B-C line, and B/C's half-spacing from centre —
 // used ONLY by the trilateration path. sqrt(34.5^2-15^2) and 30/2 cm.
@@ -195,25 +185,6 @@ static bool proximityLatched = false;
 static unsigned long lastSampleMs = 0;
 
 // Leg / turn bookkeeping
-// Live check while driving a leg -- unlike a turn, driving straight doesn't
-// rotate the robot, so a reading taken mid-leg reflects the beacon's CURRENT
-// bearing from an unchanging heading rather than being smeared across
-// different headings the way one taken mid-turn would be. That's what makes
-// it safe to look without stopping. It's still 3 quick samples rather than
-// the full 4-sample stationary average, so the margin is looser than
-// compareMargin: measured against real noise, 0.30m / 3 samples false-
-// triggers on a genuinely aligned leg only ~1.6% of the time per check, cheap
-// insurance against blindly finishing a whole leg after the operator has
-// clearly moved off to a side.
-static const unsigned long DRIVE_SNAPSHOT_MS = 3000;
-static const int DRIVE_SNAPSHOT_SAMPLES = 3;
-static const float DRIVE_CHECK_MARGIN = 0.30f;
-static float driveAccA = 0.0f, driveAccB = 0.0f, driveAccC = 0.0f;
-static int driveAccN = 0;
-static unsigned long driveSnapshotTimer = 0;
-
-static float legStartTravel = 0.0f;
-static float legStartRange = 0.0f;
 static float turnStartHeading = 0.0f;
 static float turnStepSize = 0.0f;
 static int turnSign = 1; // +1 = right, -1 = left
@@ -246,12 +217,6 @@ static int turnCode(float remaining, int s)
     if (remaining <= 45.0f)
         return (s > 0) ? 14 : 24; // PWM 80
     return (s > 0) ? 17 : 27;     // PWM 120
-}
-
-static float brakeLead()
-{
-    float lead = fabs(velocity.linear) * COAST_S;
-    return (lead > 0.50f) ? 0.50f : lead;
 }
 
 static bool proximityBlocked()
@@ -503,69 +468,29 @@ static void beginTurn(Direction d)
     Serial.println(" deg");
 }
 
-static void beginLeg()
-{
-    legStartTravel = distance.odometryTravelled;
-    legStartRange = avgRange;
-    consecutiveTurns = 0;
-    driveSnapshotTimer = millis();
-    driveAccA = driveAccB = driveAccC = 0.0f;
-    driveAccN = 0;
-    state = FOLLOW_DRIVE;
-
-    Serial.print("FOLLOW: drive — R=");
-    Serial.print(avgRange, 2);
-    Serial.print(" m, up to ");
-    Serial.print(legLength, 2);
-    Serial.println(" m");
-}
-
 // Called once a stationary averaged fix is in hand.
+// Aim at the beacon and hold. There is no drive branch: reaching DIR_FRONT
+// means "already pointing at them", and the response to that is to stop and
+// keep watching, not to close distance.
 static void decide()
 {
-    // Turn-only: range is irrelevant, so the stop/HOLD check is skipped
-    // entirely. Aim, then sit still and keep watching.
-    if (turnOnlyMode)
-    {
-        Direction d = classify();
-        lastDir = d;
-
-        if (d == DIR_FRONT)
-        {
-            motion(0);
-            Serial.print("FOLLOW: aimed (R=");
-            Serial.print(avgRange, 2);
-            Serial.println(" m) — holding, turn-only mode");
-            beginMeasure(); // keep looking, so moving the beacon re-aims it
-        }
-        else
-        {
-            beginTurn(d);
-        }
-        return;
-    }
-
-    if (avgRange <= stopRange + brakeLead())
-    {
-        motion(0);
-        state = FOLLOW_HOLD;
-        accA = accB = accC = 0.0f;
-        accN = 0;
-        Serial.print("FOLLOW: stop — ");
-        Serial.print(avgRange, 2);
-        Serial.print(" m (limit ");
-        Serial.print(stopRange, 2);
-        Serial.println(" m)");
-        return;
-    }
-
     Direction d = classify();
     lastDir = d;
 
     if (d == DIR_FRONT)
-        beginLeg();
+    {
+        motion(0);
+        consecutiveTurns = 0;
+        Serial.print("FOLLOW: aimed at beacon (R=");
+        Serial.print(avgRange, 2);
+        Serial.println(" m) — holding");
+        // Keep measuring, so moving the beacon makes it re-aim.
+        beginMeasure();
+    }
     else
+    {
         beginTurn(d);
+    }
 }
 
 // ─── Measurement intake ────────────────────────────────
@@ -625,18 +550,6 @@ bool Follow_IngestLine(const String &line)
         accB += b;
         accC += cc;
         accN++;
-    }
-
-    // A separate, looser accumulator for the live check while DRIVING a leg.
-    // Driving straight doesn't rotate the robot, so samples taken mid-leg are
-    // not smeared across headings the way mid-turn ones would be -- safe to
-    // collect without stopping.
-    if (state == FOLLOW_DRIVE)
-    {
-        driveAccA += a;
-        driveAccB += b;
-        driveAccC += cc;
-        driveAccN++;
     }
 
     return true;
@@ -704,23 +617,17 @@ void Follow_Stop()
 
 void Follow_PrintConfig()
 {
-    Serial.print("FOLLOW: stop<");
-    Serial.print(stopRange, 2);
-    Serial.print(" resume>");
-    Serial.print(resumeRange, 2);
-    Serial.print(" anchor<");
+    Serial.print("FOLLOW: anchor<");
     Serial.print(proximityStopRange, 2);
     Serial.print(" | margin ");
     Serial.print(compareMargin, 2);
-    Serial.print(" m | leg ");
-    Serial.print(legLength, 2);
     Serial.print(" m | turns ");
     Serial.print(turnInvert ? "INVERTED" : "normal");
     Serial.print(" | front/back ");
     Serial.print(fbInvert ? "INVERTED" : "normal");
     Serial.print(" | method ");
     Serial.print(useTrilateration ? "TRILATERATION" : "THRESHOLD");
-    Serial.println(turnOnlyMode ? " | TURN-ONLY (will not drive)" : "");
+    Serial.println(" | AIM-ONLY (this build never drives)");
 }
 
 // ─── Update ────────────────────────────────────────────
@@ -757,12 +664,11 @@ void Follow_Update()
         return;
     }
 
-    // Hard proximity stop, ahead of everything else.
-    // Skipped in turn-only mode: it exists to stop the robot DRIVING into the
-    // operator, and turn-only never drives. Left active it would latch HOLD
-    // whenever you stood close and the robot would stop aiming — the one thing
-    // this mode is for.
-    if (!turnOnlyMode && proximityBlocked())
+    // Hard proximity stop. Retained as a safety backstop even though this
+    // build never drives: if it ever does latch, the robot stops, which is
+    // always the safe outcome. It does NOT block turning, because turning in
+    // place cannot close distance on the operator.
+    if (proximityBlocked())
     {
         motion(0);
         if (state != FOLLOW_HOLD)
@@ -845,102 +751,19 @@ void Follow_Update()
     }
 
     // ── DRIVE: one leg, roughly toward the beacon ──
-    case FOLLOW_DRIVE:
-    {
-        // The front camera keeps its veto on forward motion.
-        if (!camBypass && frontCamLocked)
-        {
-            motion(0);
-            if (!camStopReported)
-            {
-                camStopReported = true;
-                Serial.println("FOLLOW: front camera blocked — waiting");
-            }
-            break;
-        }
-        camStopReported = false;
-
-        // Live check without stopping: every DRIVE_SNAPSHOT_MS, look at
-        // whatever raw samples arrived since the last check. If they say the
-        // beacon has clearly moved off-course (not just routine noise around
-        // "still roughly ahead"), stop driving now and get a proper stationary
-        // read instead of blindly finishing the rest of the leg.
-        if (millis() - driveSnapshotTimer >= DRIVE_SNAPSHOT_MS)
-        {
-            driveSnapshotTimer = millis();
-
-            if (driveAccN >= DRIVE_SNAPSHOT_SAMPLES)
-            {
-                float A = driveAccA / driveAccN;
-                float B = driveAccB / driveAccN;
-                float C = driveAccC / driveAccN;
-
-                float front = ((B + C) * 0.5f) - A;
-                if (fbInvert)
-                    front = -front;
-                float right = C - B;
-
-                if (front < -DRIVE_CHECK_MARGIN || fabs(right) > DRIVE_CHECK_MARGIN)
-                {
-                    Serial.println("FOLLOW: drifted off course while driving — stopping to look");
-                    beginMeasure();
-                    break;
-                }
-            }
-
-            driveAccA = driveAccB = driveAccC = 0.0f;
-            driveAccN = 0;
-        }
-
-        float travelled = fabs(distance.odometryTravelled - legStartTravel);
-
-        // Stop the leg early if driving straight has already closed enough
-        // distance — waiting for the full leg to finish is what let the robot
-        // overshoot stopRange before it ever re-measured. This is a lower
-        // bound on the true range (real closure rate is at most this, since
-        // the bearing may not be perfectly zero), so it can only make the
-        // robot stop too early, never too late.
-        float estRange = legStartRange - travelled;
-        if (estRange <= stopRange + brakeLead())
-        {
-            beginMeasure();
-            break;
-        }
-
-        if (travelled >= legLength)
-        {
-            beginMeasure();
-            break;
-        }
-
-        motion(3); // slow, heading-held straight line
-        break;
-    }
-
     // ── HOLD: close enough — stay put until they walk away ──
+    // ── HOLD: latched by the proximity stop ──
+    // The proximity check at the top of Follow_Update returns early for as
+    // long as it is blocked, so reaching this case at all means it has
+    // released. Resume aiming immediately. (It previously waited on a range
+    // threshold the proximity guard never consults, which could strand the
+    // robot here: proximity releases at ~1.0 m but the old exit wanted 2.3 m,
+    // so standing anywhere between the two left it frozen.)
     case FOLLOW_HOLD:
     {
         motion(0);
-
-        // Keep taking fresh stationary readings while parked, or the robot
-        // would never notice the operator walking away.
-        if (accN >= MEASURE_SAMPLES)
-        {
-            avgA = accA / accN;
-            avgB = accB / accN;
-            avgC = accC / accN;
-            avgRange = (avgA + avgB + avgC) / 3.0f;
-            accA = accB = accC = 0.0f;
-            accN = 0;
-
-            if (avgRange > resumeRange)
-            {
-                Serial.print("FOLLOW: beacon at ");
-                Serial.print(avgRange, 2);
-                Serial.println(" m — following again");
-                beginMeasure();
-            }
-        }
+        Serial.println("FOLLOW: proximity clear — resuming aim");
+        beginMeasure();
         break;
     }
 
@@ -1004,15 +827,6 @@ bool Follow_HandleCommand(const String &line)
         return true;
     }
 
-    if (line.equalsIgnoreCase("followturn"))
-    {
-        turnOnlyMode = !turnOnlyMode;
-        Serial.print("FOLLOW: TURN-ONLY mode ");
-        Serial.println(turnOnlyMode ? "ON — will aim at the beacon and hold, never drive"
-                                    : "OFF — normal follow (turn and drive)");
-        return true;
-    }
-
     if (line.equalsIgnoreCase("followtri"))
     {
         useTrilateration = !useTrilateration;
@@ -1042,64 +856,6 @@ bool Follow_HandleCommand(const String &line)
         else
         {
             Serial.println("FOLLOW: margin must be 0.03-0.21 m (above 0.216 opens a blind cone at +/-135 deg)");
-        }
-        return true;
-    }
-
-    if (upper.startsWith("FOLLOWL "))
-    {
-        float v = line.substring(8).toFloat();
-        if (v >= 0.30f && v <= 5.0f)
-        {
-            legLength = v;
-            Serial.print("FOLLOW: leg length set to ");
-            Serial.print(legLength, 2);
-            Serial.println(" m");
-        }
-        else
-        {
-            Serial.println("FOLLOW: leg must be 0.30-5.00 m");
-        }
-        return true;
-    }
-
-    if (upper.startsWith("FOLLOWR "))
-    {
-        float v = line.substring(8).toFloat();
-        if (v >= 0.20f && v <= 10.0f)
-        {
-            stopRange = v;
-            if (resumeRange < stopRange + 0.2f)
-            {
-                resumeRange = stopRange + 0.2f;
-                Serial.print("FOLLOW: resume raised to ");
-                Serial.print(resumeRange, 2);
-                Serial.println(" m to keep a margin");
-            }
-            Serial.print("FOLLOW: stop range set to ");
-            Serial.print(stopRange, 2);
-            Serial.println(" m");
-        }
-        else
-        {
-            Serial.println("FOLLOW: stop range must be 0.20-10.00 m");
-        }
-        return true;
-    }
-
-    if (upper.startsWith("FOLLOWG "))
-    {
-        float v = line.substring(8).toFloat();
-        if (v >= stopRange + 0.1f && v <= 20.0f)
-        {
-            resumeRange = v;
-            Serial.print("FOLLOW: resume range set to ");
-            Serial.print(resumeRange, 2);
-            Serial.println(" m");
-        }
-        else
-        {
-            Serial.println("FOLLOW: resume must be at least stop+0.10 m");
         }
         return true;
     }

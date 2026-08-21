@@ -3,6 +3,9 @@
 #include <Arduino.h>
 
 // ─── Follow-Me mode ────────────────────────────────────
+// AIM-ONLY build: the robot turns to face the beacon and holds. It never
+// drives -- there is no drive state and no command that can start one.
+//
 // Autonomous "walk in front of the robot and it follows you" mode driven by
 // three UWB anchors mounted on the robot, each reporting its range to one
 // fixed beacon carried by the operator:
@@ -26,13 +29,12 @@
 //     followdbg      toggle periodic debug print
 //     followrev      invert which way "right"/"left" spins the motors
 //     followfb       invert the front/back sense (if front reads as back)
-//     followturn     TURN-ONLY: aim at the beacon and hold, never drive
 //     followtri      toggle THRESHOLD vs TRILATERATION+45deg-sector method
 //     followm <m>    comparison noise margin in metres (default 0.15)
-//     followl <m>    leg length — how far it drives between measurements
-//     followr <m>    set the stop range in metres
-//     followg <m>    set the resume range in metres
 //     followp <m>    hard stop when any RAW anchor range drops below <m>
+//
+// There is deliberately no drive/leg/standoff command: this build cannot
+// translate, so range thresholds would have nothing to gate.
 
 void Follow_Init();
 void Follow_Update();
