@@ -7,19 +7,23 @@
 // drives -- there is no drive state and no command that can start one.
 //
 // Autonomous "walk in front of the robot and it follows you" mode driven by
-// three UWB anchors mounted on the robot, each reporting its range to one
+// four UWB anchors mounted on the robot, each reporting its range to one
 // fixed beacon carried by the operator:
 //
 //     A  FORWARD  — mounted pointing forward
 //     B  RIGHT    — mounted on the right
 //     C  LEFT     — mounted on the left
+//     D  BACK     — mounted pointing backward, opposite A
 //
-// Direction comes from plain comparisons between the three raw ranges — no
+// Direction comes from plain comparisons between the raw ranges — no
 // trigonometry. Whichever anchor reads closer is the direction the beacon is
-// more toward. See the derivation at the top of follow.cpp.
+// more toward, via two opposite-pair differences: frontness = D-A,
+// rightness = C-B. Since D-A is used directly (no averaging with B/C), D's
+// accuracy now matters as much as A's for the front/back call. See the
+// derivation at the top of follow.cpp.
 //
 // Serial input format (one line per update, whitespace-flexible):
-//     A=3.35m  B=2.98m  C=3.10m
+//     A=3.35m  B=2.98m  C=3.10m  D=3.90m
 //
 // Serial commands:
 //     follow         start follow-me

@@ -10,28 +10,37 @@
 
 // ─── How this works ─────────────────────────────────────
 //
-// Three anchors range to the beacon the operator carries:
+// Four anchors range to the beacon the operator carries:
 //
 //     A  FORWARD  — mounted pointing forward
 //     B  RIGHT    — mounted on the right
 //     C  LEFT     — mounted on the left
+//     D  BACK     — mounted pointing backward, opposite A
 //
 //     B <-> C   = 30 cm
 //     A <-> B   = A <-> C  = 34-35 cm
 //
 // No trigonometry anywhere in this file. Direction comes from plain
-// comparisons between the three raw ranges — whichever anchor reads closer is
+// comparisons between the raw ranges — whichever anchor reads closer is
 // the direction the beacon is more toward. That is the whole method.
 //
-//     rightness = C - B     positive -> B is closer -> beacon is to the RIGHT
-//     frontness = avg(B,C) - A   positive -> A is closer -> beacon is AHEAD
+//     rightness = C - B    positive -> B is closer -> beacon is RIGHT
+//     frontness = D - A    positive -> A is closer -> beacon is AHEAD
+//
+// Both are pure opposite-anchor-pair differences: B/C sit on the left-right
+// axis, A/D sit on the front-back axis, one subtraction per axis. No
+// averaging, no blending with an off-axis anchor. The consequence is that
+// D's accuracy now matters as much as A's -- unlike the old 3-anchor
+// approximation (frontness = avg(B,C)-A), there is no longer a fallback
+// signal to soften a noisy D reading.
 //
 // The frontness sign was checked against this exact geometry (A 31 cm ahead of
 // the B-C line, B/C 15 cm either side): projecting a far beacon at bearing t
 // onto each anchor gives A closer whenever cos(t) > 0, i.e. whenever the
 // beacon is genuinely ahead.  So "front" is A SMALLER than B and C, not larger
 // — if that reads backwards on the real hardware, `followfb` flips the sign in
-// one command rather than needing a re-derivation.
+// one command rather than needing a re-derivation. Flipping it also flips the
+// D-A frontness the same way.
 //
 // Combining the two comparisons with a noise margin gives 8 buckets (compass
 // points) plus "aligned".  Each bucket maps to one action:
@@ -61,13 +70,18 @@
 // THIS HAS A HARD PHYSICAL CEILING. The signals cannot exceed the anchor
 // spacings that produce them:
 //
-//     max |frontness| = A's forward offset  = 0.311 m
+//     max |frontness| = A-to-D full spacing = UNMEASURED, D is a new anchor
 //     max |rightness| = B-to-C full spacing = 0.300 m
 //
 // So the margin is not a free tuning knob — it is a fraction of a very small
 // range. If it is set too high, there are angles where NEITHER signal can
-// ever clear it, and the beacon becomes invisible. That happens above
-// 0.216 m, from (m/0.311)^2 + (m/0.300)^2 >= 1.
+// ever clear it, and the beacon becomes invisible. The old 3-anchor bound
+// (0.216 m, from A's 0.311 m forward offset and B/C's 0.300 m spacing) no
+// longer applies now that frontness is measured directly as D-A: TODO once
+// the physical A<->D spacing is measured, redo
+// (m/max_frontness)^2 + (m/0.300)^2 >= 1 and update FOLLOWM's 0.03-0.21
+// validation range in Follow_HandleCommand accordingly -- until then that
+// range is carried over unverified from the old geometry.
 //
 // It was previously 0.25, i.e. past that limit, which opened a blind cone
 // around +-135 deg — beacon behind and off to a side, both signals maxing out
@@ -100,9 +114,10 @@ static const float TURN_BACK = 110.0f; // deg — BACK-LEFT / BACK-RIGHT / BACK
 // every-time design does the verify-or-abandon step for free.
 static const float PROBE_STEP = 12.0f; // deg
 
-// Hard proximity stop on the RAW per-anchor ranges — no averaging, no
-// geometry. If any single anchor reads under this, stop immediately.
-static float proximityStopRange = 0.70f;
+// Hard proximity stop on the RAW per-anchor ranges (A, B, C, and D as of the
+// 4-anchor rewrite) — no averaging, no geometry. If any single anchor reads
+// under this, stop immediately.
+static float proximityStopRange = 1.50f;
 static const float PROXIMITY_RELEASE = 0.30f; // m — extra before resuming
 
 static const int MEASURE_SAMPLES = 4;
@@ -168,19 +183,19 @@ static const float TRI_HA = 0.3107f;
 static const float TRI_HALF = 0.15f;
 
 // Accumulator for the stationary average
-static float accA = 0.0f, accB = 0.0f, accC = 0.0f;
+static float accA = 0.0f, accB = 0.0f, accC = 0.0f, accD = 0.0f;
 static int accN = 0;
 static unsigned long measureStart = 0;
 static bool measureBraked = false;
 
 // Latest averaged fix
-static float avgA = 0.0f, avgB = 0.0f, avgC = 0.0f;
+static float avgA = 0.0f, avgB = 0.0f, avgC = 0.0f, avgD = 0.0f;
 static float avgRange = 0.0f;
 static Direction lastDir = DIR_FRONT;
 static bool lastWasTiebreak = false; // classify() set this from a weak lean, not a confident reading
 
 // Raw, unfiltered, for the proximity stop
-static float rawA = 0.0f, rawB = 0.0f, rawC = 0.0f;
+static float rawA = 0.0f, rawB = 0.0f, rawC = 0.0f, rawD = 0.0f;
 static bool proximityLatched = false;
 static unsigned long lastSampleMs = 0;
 
@@ -226,6 +241,8 @@ static bool proximityBlocked()
     float nearest = (rawA < rawB) ? rawA : rawB;
     if (rawC > 0.0f && rawC < nearest)
         nearest = rawC;
+    if (rawD > 0.0f && rawD < nearest)
+        nearest = rawD;
 
     if (nearest <= 0.0f)
         return proximityLatched;
@@ -302,7 +319,12 @@ static Direction classify()
     if (useTrilateration)
         return classifyTrilateration();
 
-    float frontness = ((avgB + avgC) * 0.5f) - avgA; // + = A closer = ahead
+    // D sits opposite A, so D-A is a direct read on the front-back axis --
+    // same idea as rightness = C-B on the left-right axis. Pure opposite-pair
+    // differencing, no averaging with B/C. Note this means D's accuracy now
+    // matters as much as A's for the front/back call: there's no longer a
+    // B/C-derived fallback softening a noisy D.
+    float frontness = avgD - avgA; // + = A closer than D = ahead
     if (fbInvert)
         frontness = -frontness;
 
@@ -385,6 +407,8 @@ static void printLiveFix()
     Serial.print(rawB, 2);
     Serial.print("/");
     Serial.print(rawC, 2);
+    Serial.print("/");
+    Serial.print(rawD, 2);
     Serial.print(" R=");
     Serial.print(avgRange, 2);
     Serial.print(" dir=");
@@ -403,7 +427,7 @@ static void beginMeasure()
     motion(0);
     measureStart = millis();
     measureBraked = false;
-    accA = accB = accC = 0.0f;
+    accA = accB = accC = accD = 0.0f;
     accN = 0;
     state = FOLLOW_MEASURE;
 }
@@ -522,10 +546,12 @@ bool Follow_IngestLine(const String &line)
         return false;
 
     int ci = u.indexOf("C=", bi + 2);
+    int di = (ci >= 0) ? u.indexOf("D=", ci + 2) : -1;
 
     float a = parseRangeField(u, ai + 2, bi);
     float b = parseRangeField(u, bi + 2, (ci >= 0) ? ci : u.length());
-    float cc = (ci >= 0) ? parseRangeField(u, ci + 2, u.length()) : 0.0f;
+    float cc = (ci >= 0) ? parseRangeField(u, ci + 2, (di >= 0) ? di : u.length()) : 0.0f;
+    float d = (di >= 0) ? parseRangeField(u, di + 2, u.length()) : 0.0f;
 
     // Raw values are captured before any rejection: a reading too small to be a
     // plausible range is still evidence the operator is close, and the guard
@@ -536,9 +562,11 @@ bool Follow_IngestLine(const String &line)
         rawB = b;
     if (cc > 0.0f && cc < 50.0f)
         rawC = cc;
+    if (d > 0.0f && d < 50.0f)
+        rawD = d;
 
-    if (a <= 0.05f || a > 50.0f || b <= 0.05f || b > 50.0f || cc <= 0.05f || cc > 50.0f)
-        return true; // addressed to us, just not a usable triple
+    if (a <= 0.05f || a > 50.0f || b <= 0.05f || b > 50.0f || cc <= 0.05f || cc > 50.0f || d <= 0.05f || d > 50.0f)
+        return true; // addressed to us, just not a usable quad
 
     lastSampleMs = millis();
 
@@ -551,6 +579,7 @@ bool Follow_IngestLine(const String &line)
         accA += a;
         accB += b;
         accC += cc;
+        accD += d;
         accN++;
     }
 
@@ -563,7 +592,7 @@ void Follow_Init()
 {
     state = FOLLOW_OFF;
     lastSampleMs = 0;
-    rawA = rawB = rawC = 0.0f;
+    rawA = rawB = rawC = rawD = 0.0f;
     proximityLatched = false;
 }
 
@@ -678,6 +707,8 @@ void Follow_Update()
             float nr = (rawA < rawB) ? rawA : rawB;
             if (rawC > 0.0f && rawC < nr)
                 nr = rawC;
+            if (rawD > 0.0f && rawD < nr)
+                nr = rawD;
             Serial.print("FOLLOW: proximity stop — anchor ");
             Serial.print(nr, 2);
             Serial.println(" m");
@@ -728,6 +759,7 @@ void Follow_Update()
         avgA = accA / accN;
         avgB = accB / accN;
         avgC = accC / accN;
+        avgD = accD / accN;
         avgRange = (avgA + avgB + avgC) / 3.0f;
 
         decide();
