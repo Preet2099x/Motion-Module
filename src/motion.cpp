@@ -486,6 +486,82 @@ void motion(int _data)
     analogWrite(pwmPin_R, currentPwmR);
   }
 
+  // Follow-me-only boosted turn codes. Mirror 11-30 exactly (same dir pins,
+  // same 3-tier structure) but at higher PWM. Kept as their own code range,
+  // never shared with drive.cpp/navigation.cpp, so speeding up follow-me
+  // turns cannot change the speed of any other turn in the codebase.
+  else if (_data >= 31 && _data <= 40)
+  {
+    headingHoldActive = false;
+    headingCaptureStart = 0;
+    headingIntegral = 0;
+    previousHeadingError = 0;
+    previousPidTime = 0;
+    pidError = 0;
+    pidCorrection = 0;
+    targetHeading = currentHeading;
+
+    digitalWrite(dirPin_L, LOW);
+    digitalWrite(dirPin_R, HIGH);
+
+    if (_data <= 33)
+    {
+      currentPwmL = 90;
+      currentPwmR = 90;
+    }
+    else if (_data <= 36)
+    {
+      currentPwmL = 130;
+      currentPwmR = 130;
+    }
+    else
+    {
+      currentPwmL = 190;
+      currentPwmR = 190;
+    }
+
+    debugPwmL = currentPwmL;
+    debugPwmR = currentPwmR;
+    analogWrite(pwmPin_L, currentPwmL);
+    analogWrite(pwmPin_R, currentPwmR);
+  }
+
+  else if (_data >= 41 && _data <= 50)
+  {
+    headingHoldActive = false;
+    headingCaptureStart = 0;
+    headingIntegral = 0;
+    previousHeadingError = 0;
+    previousPidTime = 0;
+    pidError = 0;
+    pidCorrection = 0;
+    targetHeading = currentHeading;
+    digitalWrite(dirPin_L, HIGH);
+    digitalWrite(dirPin_R, LOW);
+
+    if (_data <= 43)
+    {
+      currentPwmL = 90;
+      currentPwmR = 90;
+    }
+    else if (_data <= 46)
+    {
+      currentPwmL = 130;
+      currentPwmR = 130;
+    }
+    else
+    {
+      currentPwmL = 190;
+      currentPwmR = 190;
+    }
+
+    debugPwmL = currentPwmL;
+    debugPwmR = currentPwmR;
+
+    analogWrite(pwmPin_L, currentPwmL);
+    analogWrite(pwmPin_R, currentPwmR);
+  }
+
   else if (_data >= 111 && _data <= 120)
   {
     headingHoldActive = false;

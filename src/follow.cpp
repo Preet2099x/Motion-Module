@@ -204,8 +204,10 @@ static float normalizeAngle(float angle)
     return angle;
 }
 
-// motion.cpp: forward is both dir pins LOW; 11-20 drives the left wheel
-// forward and reverses the right (spins RIGHT), 21-30 the opposite.
+// motion.cpp: forward is both dir pins LOW; 31-40 drives the left wheel
+// forward and reverses the right (spins RIGHT), 41-50 the opposite — the
+// same pin pattern as 11-30, just a follow-me-only code range so these PWMs
+// can be tuned without touching drive.cpp/navigation.cpp's turn speed.
 // turnInvert swaps them if the robot disagrees in the field.
 static int turnCode(float remaining, int s)
 {
@@ -213,10 +215,10 @@ static int turnCode(float remaining, int s)
         s = -s;
 
     if (remaining <= 20.0f)
-        return (s > 0) ? 11 : 21; // PWM 60
+        return (s > 0) ? 31 : 41; // PWM 90
     if (remaining <= 45.0f)
-        return (s > 0) ? 14 : 24; // PWM 80
-    return (s > 0) ? 17 : 27;     // PWM 120
+        return (s > 0) ? 34 : 44; // PWM 130
+    return (s > 0) ? 37 : 47;     // PWM 190
 }
 
 static bool proximityBlocked()
