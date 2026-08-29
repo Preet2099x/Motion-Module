@@ -241,8 +241,8 @@ void motion(int _data)
   if (_data == 1)
   {
 
-    digitalWrite(dirPin_R, LOW);
-    digitalWrite(dirPin_L, LOW);
+    digitalWrite(dirPin_R, HIGH);
+    digitalWrite(dirPin_L, HIGH);
 
     int pwm = applyStartRamp(
         straightBoost ? 255 : 200,
@@ -307,8 +307,8 @@ void motion(int _data)
 
   else if (_data == 2)
   {
-    digitalWrite(dirPin_R, HIGH);
-    digitalWrite(dirPin_L, HIGH);
+    digitalWrite(dirPin_R, LOW);
+    digitalWrite(dirPin_L, LOW);
 
     int pwm = applyStartRamp(
         straightBoost ? 255 : 200,
@@ -382,8 +382,8 @@ void motion(int _data)
     pidCorrection = 0;
     targetHeading = currentHeading;
     
-    digitalWrite(dirPin_R, LOW);
-    digitalWrite(dirPin_L, LOW);
+    digitalWrite(dirPin_R, HIGH);
+    digitalWrite(dirPin_L, HIGH);
     currentPwmL = straightBoost ? 150 : 120;
     currentPwmR = straightBoost ? 150 : 120;
     debugPwmL = currentPwmL;
@@ -403,8 +403,8 @@ void motion(int _data)
     pidCorrection = 0;
     targetHeading = currentHeading;
 
-    digitalWrite(dirPin_R, HIGH);
-    digitalWrite(dirPin_L, HIGH);
+    digitalWrite(dirPin_R, LOW);
+    digitalWrite(dirPin_L, LOW);
     currentPwmL = straightBoost ? 150 : 120;
     currentPwmR = straightBoost ? 150 : 120;
     debugPwmL = currentPwmL;
@@ -425,8 +425,8 @@ void motion(int _data)
     pidCorrection = 0;
     targetHeading = currentHeading;
 
-    digitalWrite(dirPin_L, LOW);
-    digitalWrite(dirPin_R, HIGH);
+    digitalWrite(dirPin_L, HIGH);
+    digitalWrite(dirPin_R, LOW);
 
     if (_data <= 13)
     {
@@ -460,8 +460,8 @@ void motion(int _data)
     pidError = 0;
     pidCorrection = 0;
     targetHeading = currentHeading;
-    digitalWrite(dirPin_L, HIGH);
-    digitalWrite(dirPin_R, LOW);
+    digitalWrite(dirPin_L, LOW);
+    digitalWrite(dirPin_R, HIGH);
 
     if (_data <= 23)
     {
@@ -501,8 +501,8 @@ void motion(int _data)
     pidCorrection = 0;
     targetHeading = currentHeading;
 
-    digitalWrite(dirPin_L, LOW);
-    digitalWrite(dirPin_R, HIGH);
+    digitalWrite(dirPin_L, HIGH);
+    digitalWrite(dirPin_R, LOW);
 
     if (_data <= 33)
     {
@@ -536,8 +536,8 @@ void motion(int _data)
     pidError = 0;
     pidCorrection = 0;
     targetHeading = currentHeading;
-    digitalWrite(dirPin_L, HIGH);
-    digitalWrite(dirPin_R, LOW);
+    digitalWrite(dirPin_L, LOW);
+    digitalWrite(dirPin_R, HIGH);
 
     if (_data <= 43)
     {
@@ -572,8 +572,8 @@ void motion(int _data)
     pidError = 0;
     pidCorrection = 0;
     targetHeading = currentHeading;
-    digitalWrite(dirPin_L, LOW);
-    digitalWrite(dirPin_R, LOW);
+    digitalWrite(dirPin_L, HIGH);
+    digitalWrite(dirPin_R, HIGH);
 
     if (_data <= 113)
     {
@@ -607,8 +607,8 @@ void motion(int _data)
     pidError = 0;
     pidCorrection = 0;
     targetHeading = currentHeading;
-    digitalWrite(dirPin_L, LOW);
-    digitalWrite(dirPin_R, LOW);
+    digitalWrite(dirPin_L, HIGH);
+    digitalWrite(dirPin_R, HIGH);
 
     if (_data <= 123)
     {
@@ -643,8 +643,8 @@ void motion(int _data)
     pidCorrection = 0;
     targetHeading = currentHeading;
 
-    digitalWrite(dirPin_L, HIGH);
-    digitalWrite(dirPin_R, HIGH);
+    digitalWrite(dirPin_L, LOW);
+    digitalWrite(dirPin_R, LOW);
 
     if (_data <= 223)
     {
@@ -678,8 +678,8 @@ void motion(int _data)
     pidError = 0;
     pidCorrection = 0;
     targetHeading = currentHeading;
-    digitalWrite(dirPin_L, HIGH);
-    digitalWrite(dirPin_R, HIGH);
+    digitalWrite(dirPin_L, LOW);
+    digitalWrite(dirPin_R, LOW);
 
     if (_data <= 213)
     {
