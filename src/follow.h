@@ -3,42 +3,34 @@
 #include <Arduino.h>
 
 // ─── Follow-Me mode ────────────────────────────────────
-// AIM-ONLY build: the robot turns to face the beacon and holds. It never
-// drives -- there is no drive state and no command that can start one.
+// AIM-ONLY: the robot turns to face the beacon and holds. It does not
+// drive forward — that will be added later.
 //
-// Autonomous "walk in front of the robot and it follows you" mode driven by
-// four UWB anchors mounted on the robot, each reporting its range to one
-// fixed beacon carried by the operator:
+// Four UWB anchors on the robot, each reporting range to a beacon the
+// operator carries:
 //
-//     A  FORWARD  — mounted pointing forward
-//     B  RIGHT    — mounted on the right
-//     C  LEFT     — mounted on the left
-//     D  BACK     — mounted pointing backward, opposite A
+//     A  FRONT   — mounted pointing forward
+//     B  RIGHT   — mounted on the right side
+//     C  LEFT    — mounted on the left side
+//     D  BACK    — mounted pointing backward
 //
-// Direction comes from plain comparisons between the raw ranges — no
-// trigonometry. Whichever anchor reads closer is the direction the beacon is
-// more toward, via two opposite-pair differences: frontness = D-A,
-// rightness = C-B. Since D-A is used directly (no averaging with B/C), D's
-// accuracy now matters as much as A's for the front/back call. See the
-// derivation at the top of follow.cpp.
+// Direction logic (no trigonometry):
+//   Front/back:  A vs D  →  whichever is closer, beacon is that way
+//   Left/right:  B vs C  →  whichever is closer, beacon is that way
+//   Combine → 8 cardinal directions → fixed turn angle per direction.
 //
-// Serial input format (one line per update, whitespace-flexible):
+// Serial input format (one line per update):
 //     A=3.35m  B=2.98m  C=3.10m  D=3.90m
 //
 // Serial commands:
 //     follow         start follow-me
 //     followstop     stop follow-me
 //     followmon      live readout with the motors idle (bring-up)
-//     followcfg      print current configuration + live beacon state
+//     followcfg      print current configuration
 //     followdbg      toggle periodic debug print
 //     followrev      invert which way "right"/"left" spins the motors
-//     followfb       invert the front/back sense (if front reads as back)
-//     followtri      toggle THRESHOLD vs TRILATERATION+45deg-sector method
 //     followm <m>    comparison noise margin in metres (default 0.15)
 //     followp <m>    hard stop when any RAW anchor range drops below <m>
-//
-// There is deliberately no drive/leg/standoff command: this build cannot
-// translate, so range thresholds would have nothing to gate.
 
 void Follow_Init();
 void Follow_Update();
