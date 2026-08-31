@@ -1,11 +1,8 @@
 #include "follow.h"
 #include "drive.h"
 #include "navigation.h"
-#include "distance.h"
-#include "velocity.h"
 
 #include <Arduino.h>
-#include <math.h>
 #include <var.h>
 
 // ─── How this works ─────────────────────────────────────
@@ -18,41 +15,30 @@
 //     C  LEFT    — mounted on the left side
 //     D  BACK    — mounted pointing backward
 //
-// Direction logic (no trigonometry):
+// Two simple states, no bearing math, no fixed turn angles:
 //
-//     Front/back axis:  compare A vs D
-//       A < D  →  beacon is AHEAD      (front component)
-//       D < A  →  beacon is BEHIND     (back component)
+//   TURN:  A is not yet the closest anchor. Rotate in place toward
+//          whichever of B/C currently reads smaller (that's the side the
+//          beacon leans toward). Keep rotating until A becomes the
+//          closest of all four — i.e. the beacon is roughly ahead.
 //
-//     Left/right axis:  compare B vs C
-//       B < C  →  beacon is to the RIGHT
-//       C < B  →  beacon is to the LEFT
+//   DRIVE: A is the closest anchor. Drive forward, and every ~300ms check
+//          which of B/C has gotten smaller since the last check — curve
+//          gently toward that side (motion 115 = curve right toward B,
+//          125 = curve left toward C). If neither moved, drive straight.
+//          If A stops being the closest anchor, the beacon has drifted
+//          off-ahead — stop curving and go back to TURN.
 //
-//     Combine both axes → 8 cardinal directions.
+// Turning uses only the slowest follow-me-only tier (31/41, PWM 90) and
+// driving uses the slow shared gear (motion 3) rather than full speed —
+// intentionally low PWM for now while this logic is being tried out, so a
+// wrong turn is a slow bump, not a collision.
 //
-// The robot turns a fixed angle per direction until A is the closest
-// anchor (beacon is in front), then drives forward toward it.
 // Stops when any anchor reads below the arrival threshold (default 2m).
 
 // ─── Tuning ────────────────────────────────────────────
 
-// Noise margin: a difference smaller than this is treated as "can't tell"
-// rather than acted on. Prevents dithering when two anchors read almost
-// the same distance.
-static float compareMargin = 0.15f; // m
-
-// Turn angles — small steps, so the robot converges gradually and never
-// overshoots. After each step it re-checks and turns more if needed.
-static const float TURN_FRONT_SIDE = 20.0f;  // deg — FRONT-LEFT / FRONT-RIGHT
-static const float TURN_SIDE       = 30.0f;  // deg — LEFT / RIGHT
-static const float TURN_BACK_SIDE  = 45.0f;  // deg — BACK-LEFT / BACK-RIGHT
-static const float TURN_BACK       = 45.0f;  // deg — BACK (multiple steps to 180°)
-
-// Max distance to drive before stopping to re-aim (metres)
-static const float DRIVE_REALIGN_DIST = 0.5f;
-
-// If min(all anchors) increases by more than this, we've passed the beacon
-static const float DRIVE_WRONG_WAY_MARGIN = 0.08f; // m
+static const float ANCHOR_EMA_ALPHA = 0.3f; // 0..1, higher = less smoothing
 
 // Arrival threshold: if ANY raw anchor distance drops below this while
 // driving, stop following — the robot has arrived.
@@ -63,38 +49,22 @@ static float arrivalRange = 2.00f; // m
 static float proximityStopRange = 1.50f;
 static const float PROXIMITY_RELEASE = 0.30f; // m — extra before resuming
 
-static const int MEASURE_SAMPLES = 2;
-static const unsigned long BRAKE_MS = 200; // motion(0) coast before trusting a sample
-static const unsigned long MEASURE_TIMEOUT_MS = 9000;
-
 static const unsigned long DATA_TIMEOUT_MS = 3500;
 static const unsigned long DEBUG_INTERVAL_MS = 700;
 
-// If the robot turns this many times in a row without ever reaching FRONT,
-// something is wrong — flag it instead of spinning silently forever.
-static const int STUCK_TURN_WARNING = 8;
+// How often to re-check which side is closing in and re-pick a steer
+// direction. Checking every single tick would just react to sample noise.
+static const unsigned long STEER_CHECK_MS = 300;
+static float steerMargin = 0.02f; // m — tune with followm
 
 // ─── State ─────────────────────────────────────────────
 
 enum FollowState
 {
     FOLLOW_OFF,
-    FOLLOW_MEASURE, // stopped, averaging a clean fix
-    FOLLOW_TURN,    // rotating a fixed amount for the current bucket
-    FOLLOW_DRIVE,   // aimed at beacon, driving forward
-    FOLLOW_HOLD     // arrived — any anchor < arrivalRange
-};
-
-enum Direction
-{
-    DIR_FRONT,
-    DIR_FRONT_RIGHT,
-    DIR_FRONT_LEFT,
-    DIR_RIGHT,
-    DIR_LEFT,
-    DIR_BACK_RIGHT,
-    DIR_BACK_LEFT,
-    DIR_BACK
+    FOLLOW_TURN,  // A not yet closest — rotating toward B or C
+    FOLLOW_DRIVE, // A is closest — driving forward, curving toward B/C
+    FOLLOW_HOLD   // arrived — any anchor < arrivalRange
 };
 
 static FollowState state = FOLLOW_OFF;
@@ -103,72 +73,44 @@ static bool followMonitor = false;
 
 static bool turnInvert = false; // flips which way "right"/"left" spins the motors
 
-// Accumulator for the stationary average
-static float accA = 0.0f, accB = 0.0f, accC = 0.0f, accD = 0.0f;
-static int accN = 0;
-static unsigned long measureStart = 0;
-static bool measureBraked = false;
-
-// Latest averaged fix
-static float avgA = 0.0f, avgB = 0.0f, avgC = 0.0f, avgD = 0.0f;
-static float avgRange = 0.0f;
-static Direction lastDir = DIR_FRONT;
-
-// Raw, unfiltered, for the proximity stop
+// Raw, unfiltered, for the proximity/arrival stops
 static float rawA = 0.0f, rawB = 0.0f, rawC = 0.0f, rawD = 0.0f;
 static bool proximityLatched = false;
 static unsigned long lastSampleMs = 0;
 
-// Turn bookkeeping
-static float turnStartHeading = 0.0f;
-static float turnStepSize = 0.0f;
-static int turnSign = 1; // +1 = right, -1 = left
-static int consecutiveTurns = 0;
+// EMA-smoothed anchor ranges, used for every steering decision below —
+// safety stops above deliberately keep using the raw values so they never
+// lag behind a real close approach.
+static float emaA = 0.0f, emaB = 0.0f, emaC = 0.0f, emaD = 0.0f;
+static bool emaInit = false;
+
+// DRIVE steering: reference B/C captured at the last check, and the motion
+// code currently in effect (3 = straight, 115 = curve right, 125 = curve
+// left; pre-invert).
+static unsigned long steerCheckMs = 0;
+static float steerRefB = 0.0f, steerRefC = 0.0f;
+static int driveCode = 3;
 
 static unsigned long debugTimer = 0;
 
-// Drive tracking — monitor whether we're actually getting closer
-static float driveStartDist = 0.0f;  // distance.travelled at drive start
-static float driveBaseMin   = 0.0f;  // min(A,B,C,D) baseline (should decrease)
-
-// Helper: smallest positive raw anchor
-static float rawMin()
-{
-    float m = rawA;
-    if (rawB > 0.0f && rawB < m) m = rawB;
-    if (rawC > 0.0f && rawC < m) m = rawC;
-    if (rawD > 0.0f && rawD < m) m = rawD;
-    return m;
-}
-
-// Wrong-way detection — if a turn made things worse, flip direction
-static float preTurnMin = 0.0f; // min range before the turn started
-
 // ─── Helpers ───────────────────────────────────────────
 
-static float normalizeAngle(float angle)
+// "Aimed" test: is the front anchor the closest of the four? This alone
+// gates stop-turning/start-driving, and re-aim-if-drifted while driving.
+static bool frontIsClosest()
 {
-    while (angle > 180.0f)
-        angle -= 360.0f;
-    while (angle < -180.0f)
-        angle += 360.0f;
-    return angle;
+    return emaA < emaB && emaA < emaC && emaA < emaD;
 }
 
-// Tiered turn speed: slower as we approach the target angle.
-// Uses follow-me-only motion codes 31-40 (right) and 41-50 (left)
-// so these PWMs can be tuned without touching drive/navigation.
-static int turnCode(float remaining, int s)
-{
-    if (turnInvert)
-        s = -s;
-
-    if (remaining <= 20.0f)
-        return (s > 0) ? 31 : 41; // PWM 90
-    if (remaining <= 45.0f)
-        return (s > 0) ? 34 : 44; // PWM 130
-    return (s > 0) ? 37 : 47;     // PWM 190
-}
+// Right/left motion codes, honoring followrev. Verified against drive.cpp:
+// CMD_RIGHT uses 11/13/15 and the analogous "left wheel faster" curve
+// family 111-120 (which includes 115); CMD_LEFT uses 21/23/25 and the
+// "right wheel faster" family 121-130 (includes 125). So B (right anchor)
+// pairs with the 31.../115 codes, C (left anchor) with 41.../125.
+static int rightTurnCode()  { return turnInvert ? 41 : 31; }
+static int leftTurnCode()   { return turnInvert ? 31 : 41; }
+static int rightCurveCode() { return turnInvert ? 125 : 115; }
+static int leftCurveCode()  { return turnInvert ? 115 : 125; }
 
 static bool proximityBlocked()
 {
@@ -194,129 +136,6 @@ static bool proximityBlocked()
     return proximityLatched;
 }
 
-static const char *dirName(Direction d)
-{
-    switch (d)
-    {
-    case DIR_FRONT:       return "FRONT";
-    case DIR_FRONT_RIGHT: return "FRONT-RIGHT";
-    case DIR_FRONT_LEFT:  return "FRONT-LEFT";
-    case DIR_RIGHT:       return "RIGHT";
-    case DIR_LEFT:        return "LEFT";
-    case DIR_BACK_RIGHT:  return "BACK-RIGHT";
-    case DIR_BACK_LEFT:   return "BACK-LEFT";
-    case DIR_BACK:        return "BACK";
-    default:              return "?";
-    }
-}
-
-// ─── Direction classifier ──────────────────────────────
-//
-// Two comparisons, one per axis:
-//   frontness = D - A   →  positive means A is closer → beacon is AHEAD
-//   rightness = C - B   →  positive means B is closer → beacon is RIGHT
-//
-// If neither axis clears the margin, fall back to whichever single
-// anchor reads the smallest distance.
-
-static Direction classify()
-{
-    float frontness = avgD - avgA; // + = beacon ahead (A closer)
-    float rightness = avgC - avgB; // + = beacon right (B closer)
-
-    bool isFront = frontness > compareMargin;
-    bool isBack  = frontness < -compareMargin;
-    bool isRight = rightness > compareMargin;
-    bool isLeft  = rightness < -compareMargin;
-
-    // Both axes have a clear signal
-    if (isFront && isRight) return DIR_FRONT_RIGHT;
-    if (isFront && isLeft)  return DIR_FRONT_LEFT;
-    if (isFront)            return DIR_FRONT;
-
-    if (isBack && isRight)  return DIR_BACK_RIGHT;
-    if (isBack && isLeft)   return DIR_BACK_LEFT;
-    if (isBack)             return DIR_BACK;
-
-    if (isRight)            return DIR_RIGHT;
-    if (isLeft)             return DIR_LEFT;
-
-    // Neither axis cleared the margin — fallback: which anchor is closest?
-    float minDist = avgA;
-    Direction fallback = DIR_FRONT;
-
-    if (avgB < minDist) { minDist = avgB; fallback = DIR_RIGHT; }
-    if (avgC < minDist) { minDist = avgC; fallback = DIR_LEFT;  }
-    if (avgD < minDist) { minDist = avgD; fallback = DIR_BACK;  }
-
-    return fallback;
-}
-
-// ─── Turn / measure logic ──────────────────────────────
-
-static void beginMeasure()
-{
-    motion(0);
-    measureStart = millis();
-    measureBraked = false;
-    accA = accB = accC = accD = 0.0f;
-    accN = 0;
-    state = FOLLOW_MEASURE;
-}
-
-static void beginTurn(Direction d)
-{
-    switch (d)
-    {
-    case DIR_FRONT_RIGHT:
-        turnSign = 1;
-        turnStepSize = TURN_FRONT_SIDE;
-        break;
-    case DIR_FRONT_LEFT:
-        turnSign = -1;
-        turnStepSize = TURN_FRONT_SIDE;
-        break;
-    case DIR_RIGHT:
-        turnSign = 1;
-        turnStepSize = TURN_SIDE;
-        break;
-    case DIR_LEFT:
-        turnSign = -1;
-        turnStepSize = TURN_SIDE;
-        break;
-    case DIR_BACK_RIGHT:
-        turnSign = 1;
-        turnStepSize = TURN_BACK_SIDE;
-        break;
-    case DIR_BACK_LEFT:
-        turnSign = -1;
-        turnStepSize = TURN_BACK_SIDE;
-        break;
-    case DIR_BACK:
-    default:
-        turnSign = 1; // dead behind — default to right
-        turnStepSize = TURN_BACK;
-        break;
-    }
-
-    turnStartHeading = currentHeading;
-    state = FOLLOW_TURN;
-    consecutiveTurns++;
-
-    if (consecutiveTurns == STUCK_TURN_WARNING)
-    {
-        Serial.println("FOLLOW: many turns without reaching FRONT — check followrev / followm");
-        consecutiveTurns = 0;
-    }
-
-    Serial.print("FOLLOW: ");
-    Serial.print(dirName(d));
-    Serial.print(" -> turn ");
-    Serial.print(turnSign > 0 ? "RIGHT " : "LEFT ");
-    Serial.print(turnStepSize, 0);
-    Serial.println(" deg");
-}
-
 // Check if any raw anchor is below the arrival threshold
 static bool hasArrived()
 {
@@ -325,77 +144,6 @@ static bool hasArrived()
     if (rawC > 0.0f && rawC < arrivalRange) return true;
     if (rawD > 0.0f && rawD < arrivalRange) return true;
     return false;
-}
-
-// Quick direction check from live raw data (no averaging needed)
-// Used while driving to detect if beacon drifted off-front
-static Direction classifyRaw()
-{
-    float frontness = rawD - rawA;
-    float rightness = rawC - rawB;
-
-    bool isFront = frontness > compareMargin;
-    bool isBack  = frontness < -compareMargin;
-    bool isRight = rightness > compareMargin;
-    bool isLeft  = rightness < -compareMargin;
-
-    if (isFront && isRight) return DIR_FRONT_RIGHT;
-    if (isFront && isLeft)  return DIR_FRONT_LEFT;
-    if (isFront)            return DIR_FRONT;
-
-    if (isBack && isRight)  return DIR_BACK_RIGHT;
-    if (isBack && isLeft)   return DIR_BACK_LEFT;
-    if (isBack)             return DIR_BACK;
-
-    if (isRight)            return DIR_RIGHT;
-    if (isLeft)             return DIR_LEFT;
-
-    // Fallback: smallest raw anchor
-    float minDist = rawA;
-    Direction fallback = DIR_FRONT;
-    if (rawB > 0.0f && rawB < minDist) { minDist = rawB; fallback = DIR_RIGHT; }
-    if (rawC > 0.0f && rawC < minDist) { minDist = rawC; fallback = DIR_LEFT;  }
-    if (rawD > 0.0f && rawD < minDist) { minDist = rawD; fallback = DIR_BACK;  }
-    return fallback;
-}
-
-// Called once a stationary averaged fix is ready.
-static void decide()
-{
-    Direction d = classify();
-    lastDir = d;
-
-    // If the previous turn made things WORSE (min range increased),
-    // flip direction — the other way is more likely correct.
-    float curMin = rawMin();
-    if (consecutiveTurns > 0 && preTurnMin > 0.0f && curMin > preTurnMin + 0.05f)
-    {
-        Serial.println("FOLLOW: last turn made range worse — flipping direction");
-        if (d == DIR_RIGHT)       d = DIR_LEFT;
-        else if (d == DIR_LEFT)   d = DIR_RIGHT;
-        else if (d == DIR_BACK_RIGHT) d = DIR_BACK_LEFT;
-        else if (d == DIR_BACK_LEFT)  d = DIR_BACK_RIGHT;
-        else if (d == DIR_FRONT_RIGHT) d = DIR_FRONT_LEFT;
-        else if (d == DIR_FRONT_LEFT)  d = DIR_FRONT_RIGHT;
-        lastDir = d;
-    }
-
-    if (d == DIR_FRONT)
-    {
-        consecutiveTurns = 0;
-        Serial.print("FOLLOW: aimed at beacon (R=");
-        Serial.print(avgRange, 2);
-        Serial.println(" m) — driving forward");
-        state = FOLLOW_DRIVE;
-        driveStartDist = distance.travelled;
-        driveBaseMin = rawMin();
-        motion(1); // drive forward
-    }
-    else
-    {
-        preTurnMin = rawMin(); // save before turning so we can detect wrong-way
-        beginTurn(d);
-    }
 }
 
 static void printLiveFix()
@@ -412,10 +160,10 @@ static void printLiveFix()
     Serial.print(rawC, 2);
     Serial.print(" D=");
     Serial.print(rawD, 2);
-    Serial.print(" | dir=");
-    Serial.print(dirName(lastDir));
-    Serial.print(" st=");
-    Serial.println((int)state);
+    Serial.print(" | st=");
+    Serial.print((int)state);
+    Serial.print(" cmd=");
+    Serial.println(state == FOLLOW_DRIVE ? driveCode : 0);
 }
 
 // ─── Measurement intake ────────────────────────────────
@@ -454,30 +202,31 @@ bool Follow_IngestLine(const String &line)
 
     // Raw values captured before rejection — proximity stop must not be filtered out
     if (a > 0.0f && a < 50.0f)
+    {
         rawA = a;
+        emaA = emaInit ? emaA + ANCHOR_EMA_ALPHA * (a - emaA) : a;
+    }
     if (b > 0.0f && b < 50.0f)
+    {
         rawB = b;
+        emaB = emaInit ? emaB + ANCHOR_EMA_ALPHA * (b - emaB) : b;
+    }
     if (cc > 0.0f && cc < 50.0f)
+    {
         rawC = cc;
+        emaC = emaInit ? emaC + ANCHOR_EMA_ALPHA * (cc - emaC) : cc;
+    }
     if (d > 0.0f && d < 50.0f)
+    {
         rawD = d;
+        emaD = emaInit ? emaD + ANCHOR_EMA_ALPHA * (d - emaD) : d;
+    }
+    emaInit = true;
 
     if (a <= 0.05f || a > 50.0f || b <= 0.05f || b > 50.0f || cc <= 0.05f || cc > 50.0f || d <= 0.05f || d > 50.0f)
         return true; // addressed to us, just not a usable quad
 
     lastSampleMs = millis();
-
-    // Only accumulate while genuinely stopped — rotating changes heading
-    // between samples, which would blend different orientations.
-    if ((state == FOLLOW_MEASURE && measureBraked) || state == FOLLOW_HOLD)
-    {
-        accA += a;
-        accB += b;
-        accC += cc;
-        accD += d;
-        accN++;
-    }
-
     return true;
 }
 
@@ -488,6 +237,8 @@ void Follow_Init()
     state = FOLLOW_OFF;
     lastSampleMs = 0;
     rawA = rawB = rawC = rawD = 0.0f;
+    emaA = emaB = emaC = emaD = 0.0f;
+    emaInit = false;
     proximityLatched = false;
 }
 
@@ -509,8 +260,8 @@ void Follow_Start()
     Navigation_Cancel();
 
     proximityLatched = false;
-    consecutiveTurns = 0;
-    beginMeasure();
+    steerCheckMs = 0;
+    state = FOLLOW_TURN;
 
     Serial.println("FOLLOW: --- FOLLOW-ME ARMED --- waiting for beacon data");
     Follow_PrintConfig();
@@ -544,11 +295,11 @@ void Follow_PrintConfig()
     Serial.print(arrivalRange, 2);
     Serial.print(" | proximity<");
     Serial.print(proximityStopRange, 2);
-    Serial.print(" | margin ");
-    Serial.print(compareMargin, 2);
+    Serial.print(" | steer margin ");
+    Serial.print(steerMargin, 2);
     Serial.print(" m | turns ");
     Serial.print(turnInvert ? "INVERTED" : "normal");
-    Serial.println(" | TURN+DRIVE");
+    Serial.println(" | TURN+CURVE (low PWM)");
 }
 
 // ─── Update ────────────────────────────────────────────
@@ -574,10 +325,10 @@ void Follow_Update()
     if ((lastSampleMs == 0) || (millis() - lastSampleMs > DATA_TIMEOUT_MS))
     {
         motion(0);
-        if (state != FOLLOW_MEASURE)
+        if (state != FOLLOW_TURN)
         {
             Serial.println("FOLLOW: beacon data lost — stopping");
-            beginMeasure();
+            state = FOLLOW_TURN;
         }
         return;
     }
@@ -612,8 +363,6 @@ void Follow_Update()
             Serial.print(nr, 2);
             Serial.println(" m");
             state = FOLLOW_HOLD;
-            accA = accB = accC = accD = 0.0f;
-            accN = 0;
         }
         return;
     }
@@ -623,134 +372,57 @@ void Follow_Update()
 
     switch (state)
     {
-    // ── MEASURE: stopped, averaging ──
-    case FOLLOW_MEASURE:
-    {
-        motion(0);
-
-        // Let the PWM ramp-down finish before counting anything
-        if (!measureBraked)
-        {
-            if (millis() - measureStart < BRAKE_MS)
-                break;
-            measureBraked = true;
-            measureStart = millis();
-            accA = accB = accC = accD = 0.0f;
-            accN = 0;
-            break;
-        }
-
-        if (accN < MEASURE_SAMPLES)
-        {
-            if (millis() - measureStart > MEASURE_TIMEOUT_MS && accN >= 2)
-            {
-                Serial.print("FOLLOW: measure timed out, using ");
-                Serial.print(accN);
-                Serial.println(" samples");
-            }
-            else
-            {
-                break;
-            }
-        }
-
-        avgA = accA / accN;
-        avgB = accB / accN;
-        avgC = accC / accN;
-        avgD = accD / accN;
-        avgRange = (avgA + avgB + avgC + avgD) / 4.0f;
-
-        decide();
-        break;
-    }
-
-    // ── TURN: rotate while continuously checking live beacon data ──
-    // Instead of blindly completing the full planned angle, we re-check
-    // classifyRaw() every tick. If it reads FRONT, jump straight to
-    // driving. If it changes to a different bucket, stop and re-aim.
+    // ── TURN: A not yet closest — rotate toward whichever of B/C is
+    // smaller (low PWM only, for now) ──
     case FOLLOW_TURN:
     {
-        // Live re-check from raw data (no averaging needed)
-        Direction liveDir = classifyRaw();
-        lastDir = liveDir;
-
-        if (liveDir == DIR_FRONT)
+        if (frontIsClosest())
         {
-            // We've turned enough — beacon is now in front, start driving
-            consecutiveTurns = 0;
-            Serial.println("FOLLOW: aimed mid-turn — driving forward");
+            Serial.println("FOLLOW: aimed — driving forward");
             state = FOLLOW_DRIVE;
-            motion(1);
+            steerCheckMs = millis();
+            steerRefB = emaB;
+            steerRefC = emaC;
+            driveCode = 3;
+            motion(driveCode);
             break;
         }
 
-        float turned = fabs(normalizeAngle(currentHeading - turnStartHeading));
-        float remaining = turnStepSize - turned;
-
-        if (remaining <= 0.0f)
-        {
-            // Completed full planned angle but not yet FRONT — re-measure
-            motion(0);
-            beginMeasure();
-        }
+        if (emaB < emaC)
+            motion(rightTurnCode()); // beacon leans right, toward B
         else
-        {
-            motion(turnCode(remaining, turnSign));
-        }
+            motion(leftTurnCode());  // beacon leans left, toward C
         break;
     }
 
-    // ── DRIVE: aimed at beacon, driving forward ──
+    // ── DRIVE: A is closest — drive forward, curving toward whichever
+    // of B/C has closed in since the last check ──
     case FOLLOW_DRIVE:
     {
-        // Re-check direction from live raw data every tick
-        Direction liveDir = classifyRaw();
-        lastDir = liveDir;
-
-        // Distance driven since last re-aim
-        float driven = distance.travelled - driveStartDist;
-        float curMin = rawMin();
-
-        // 1) Passed closest point: min(all anchors) started increasing
-        if (curMin > driveBaseMin + DRIVE_WRONG_WAY_MARGIN)
+        if (!frontIsClosest())
         {
-            motion(0);
-            Serial.print("FOLLOW: passed closest point (min ");
-            Serial.print(driveBaseMin, 2);
-            Serial.print(" -> ");
-            Serial.print(curMin, 2);
-            Serial.println(") — re-aiming");
-            beginMeasure();
+            Serial.println("FOLLOW: beacon no longer ahead — re-aiming");
+            state = FOLLOW_TURN;
             break;
         }
 
-        // 2) Driven far enough → mandatory re-aim
-        if (driven >= DRIVE_REALIGN_DIST)
+        if (millis() - steerCheckMs >= STEER_CHECK_MS)
         {
-            motion(0);
-            Serial.print("FOLLOW: driven ");
-            Serial.print(driven, 2);
-            Serial.println(" m — re-aiming");
-            beginMeasure();
-            break;
+            float droppedB = steerRefB - emaB; // + = B got closer
+            float droppedC = steerRefC - emaC; // + = C got closer
+            steerRefB = emaB;
+            steerRefC = emaC;
+            steerCheckMs = millis();
+
+            if (droppedB > steerMargin && droppedB >= droppedC)
+                driveCode = rightCurveCode();
+            else if (droppedC > steerMargin && droppedC > droppedB)
+                driveCode = leftCurveCode();
+            else
+                driveCode = 3;
         }
 
-        // 3) Beacon drifted off-front → stop and re-aim
-        if (liveDir != DIR_FRONT && liveDir != DIR_FRONT_LEFT && liveDir != DIR_FRONT_RIGHT)
-        {
-            motion(0);
-            Serial.print("FOLLOW: beacon drifted ");
-            Serial.print(dirName(liveDir));
-            Serial.println(" — re-aiming");
-            beginMeasure();
-            break;
-        }
-
-        // Update baseline if getting closer
-        if (curMin < driveBaseMin)
-            driveBaseMin = curMin;
-
-        motion(1); // keep driving straight
+        motion(driveCode);
         break;
     }
 
@@ -762,7 +434,7 @@ void Follow_Update()
         if (!hasArrived() && !proximityBlocked())
         {
             Serial.println("FOLLOW: beacon moved away — resuming");
-            beginMeasure();
+            state = FOLLOW_TURN;
         }
         break;
     }
@@ -825,16 +497,16 @@ bool Follow_HandleCommand(const String &line)
     if (upper.startsWith("FOLLOWM "))
     {
         float v = line.substring(8).toFloat();
-        if (v >= 0.03f && v <= 0.30f)
+        if (v >= 0.01f && v <= 0.20f)
         {
-            compareMargin = v;
-            Serial.print("FOLLOW: compare margin set to ");
-            Serial.print(compareMargin, 2);
+            steerMargin = v;
+            Serial.print("FOLLOW: steer margin set to ");
+            Serial.print(steerMargin, 2);
             Serial.println(" m");
         }
         else
         {
-            Serial.println("FOLLOW: margin must be 0.03-0.30 m");
+            Serial.println("FOLLOW: steer margin must be 0.01-0.20 m");
         }
         return true;
     }
