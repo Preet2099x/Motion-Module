@@ -245,7 +245,7 @@ void motion(int _data)
     digitalWrite(dirPin_L, HIGH);
 
     int pwm = applyStartRamp(
-        straightBoost ? 255 : 200,
+        straightBoost ? 255 : 170,
         _data);
 
     if (!headingHoldActive)
@@ -311,7 +311,7 @@ void motion(int _data)
     digitalWrite(dirPin_L, LOW);
 
     int pwm = applyStartRamp(
-        straightBoost ? 255 : 200,
+        straightBoost ? 255 : 170,
         _data);
 
     if (!headingHoldActive)
