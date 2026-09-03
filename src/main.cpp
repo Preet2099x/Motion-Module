@@ -315,10 +315,12 @@ void loop()
     rpmAlter = false;
     // Serial5.write(0);
     // Serial5.write(128);
-    digitalWrite(dirPin_L, LOW);
-    digitalWrite(dirPin_R, LOW);
-    analogWrite(pwmPin_L, 0);
-    analogWrite(pwmPin_R, 0);
+
+    // Also zeroes motion.cpp's own ramp state (currentPwmL/currentPwmR), not
+    // just the pins — otherwise Drive_Cancel()/Follow_Cancel() below call
+    // motion(0), which re-applies that stale nonzero PWM before its own
+    // ramp-down can catch up, causing a brief forward jerk right after this.
+    motion_EmergencyStop();
     data = 0; // TODO: Commenting for Testing'';
 
     // Cancel any running autonomous track on the first tick of the emergency latch
@@ -564,8 +566,8 @@ void loop()
     {
       bnoPrintTimer = millis();
 
-      // Serial.print(data);
-      // Serial.print(" | ");
+      Serial.print(data);
+      Serial.println(" | ");
 
       // Serial.print(" | Dist=");
       // Serial.print(distance.travelled, 3);

@@ -126,6 +126,7 @@ void updateEncoder_L();
 void updateEncoder_R();
 
 void motion(int _data);
+void motion_EmergencyStop();
 
 uint32_t getTeensySerial();
 float calcAlphaEMA(float fn);

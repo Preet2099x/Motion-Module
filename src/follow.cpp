@@ -34,7 +34,8 @@
 // intentionally low PWM for now while this logic is being tried out, so a
 // wrong turn is a slow bump, not a collision.
 //
-// Stops when any anchor reads below the arrival threshold (default 2m).
+// Stops when the front anchor (A) reads below the arrival threshold
+// (default 2m).
 
 // ─── Tuning ────────────────────────────────────────────
 
@@ -64,7 +65,7 @@ enum FollowState
     FOLLOW_OFF,
     FOLLOW_TURN,  // A not yet closest — rotating toward B or C
     FOLLOW_DRIVE, // A is closest — driving forward, curving toward B/C
-    FOLLOW_HOLD   // arrived — any anchor < arrivalRange
+    FOLLOW_HOLD   // arrived — A < arrivalRange
 };
 
 static FollowState state = FOLLOW_OFF;
@@ -136,14 +137,10 @@ static bool proximityBlocked()
     return proximityLatched;
 }
 
-// Check if any raw anchor is below the arrival threshold
+// Check if the front anchor is below the arrival threshold
 static bool hasArrived()
 {
-    if (rawA > 0.0f && rawA < arrivalRange) return true;
-    if (rawB > 0.0f && rawB < arrivalRange) return true;
-    if (rawC > 0.0f && rawC < arrivalRange) return true;
-    if (rawD > 0.0f && rawD < arrivalRange) return true;
-    return false;
+    return rawA > 0.0f && rawA < arrivalRange;
 }
 
 static void printLiveFix()
@@ -333,16 +330,12 @@ void Follow_Update()
         return;
     }
 
-    // Arrival check: any anchor < arrivalRange → stop following
+    // Arrival check: front anchor < arrivalRange → stop following
     if (hasArrived() && state != FOLLOW_HOLD)
     {
         motion(0);
-        float nr = rawA;
-        if (rawB > 0.0f && rawB < nr) nr = rawB;
-        if (rawC > 0.0f && rawC < nr) nr = rawC;
-        if (rawD > 0.0f && rawD < nr) nr = rawD;
-        Serial.print("FOLLOW: arrived — nearest anchor ");
-        Serial.print(nr, 2);
+        Serial.print("FOLLOW: arrived — A=");
+        Serial.print(rawA, 2);
         Serial.println(" m");
         state = FOLLOW_HOLD;
         return;
@@ -427,7 +420,7 @@ void Follow_Update()
     }
 
     // ── HOLD: arrived or proximity latched ──
-    // If the beacon moves away again (all anchors > arrivalRange), resume.
+    // If the beacon moves away again (A > arrivalRange), resume.
     case FOLLOW_HOLD:
     {
         motion(0);

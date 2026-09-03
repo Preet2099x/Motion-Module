@@ -705,3 +705,38 @@ void motion(int _data)
   }
   lastCommand = _data;
 }
+
+// True instant kill for the emergency latch — unlike motion(0), which ramps
+// currentPwmL/currentPwmR down gradually over several ticks. Callers used to
+// hard-zero the pins directly with analogWrite() and skip motion() entirely,
+// but that left currentPwmL/currentPwmR (this file's own ramp state) stale
+// at whatever they were before the latch. The moment anything called
+// motion(0) afterward — e.g. Drive_Cancel()/Follow_Cancel() on the latch's
+// first tick — it re-applied that stale, still-large PWM (with the dir pins
+// just forced LOW/LOW here, i.e. forward) before its own ramp had a chance
+// to bring it down, producing a brief forward jerk right after the "stop".
+// This zeroes the ramp state directly so any later motion(0) call is a
+// no-op instead of an unintended re-drive.
+void motion_EmergencyStop()
+{
+  currentPwmL = 0;
+  currentPwmR = 0;
+
+  headingHoldActive = false;
+  headingCaptureStart = 0;
+  headingIntegral = 0;
+  previousHeadingError = 0;
+  previousPidTime = 0;
+  pidError = 0;
+  pidCorrection = 0;
+  targetHeading = currentHeading;
+
+  rampActive = false;
+  rampCommand = 0;
+  lastCommand = 0;
+
+  digitalWrite(dirPin_L, LOW);
+  digitalWrite(dirPin_R, LOW);
+  analogWrite(pwmPin_L, 0);
+  analogWrite(pwmPin_R, 0);
+}

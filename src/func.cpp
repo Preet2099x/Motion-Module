@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <i2c_driver.h>
 #include <i2c_driver_wire.h>
+#include "follow.h"
 
 float calcAlphaEMA(float fn)
 {
@@ -63,6 +64,14 @@ void receiveEvent(int bytesReceived)
 
     if (cmd.length() == 0)
     {
+        return;
+    }
+
+    // Shortcut: 'c' over I2C starts follow-me, same as sending "follow"
+    // over serial.
+    if (cmd.length() == 1 && cmd.charAt(0) == 'c')
+    {
+        Follow_Start();
         return;
     }
 
