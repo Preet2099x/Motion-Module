@@ -35,7 +35,11 @@
 // wrong turn is a slow bump, not a collision.
 //
 // Stops when the front anchor (A) reads below the arrival threshold
-// (default 2m).
+// (default 2m). While stopped (HOLD), it keeps fine-aiming — the same
+// rotate-toward-smaller-of-B/C rule as TURN, but using the shared 11-20/
+// 21-30 in-place turn codes instead of the follow-me ones, and never
+// driving — so it settles pointed as directly at the beacon as an
+// in-place turn allows, without moving toward it.
 
 // ─── Tuning ────────────────────────────────────────────
 
@@ -112,6 +116,13 @@ static int rightTurnCode()  { return turnInvert ? 41 : 31; }
 static int leftTurnCode()   { return turnInvert ? 31 : 41; }
 static int rightCurveCode() { return turnInvert ? 125 : 115; }
 static int leftCurveCode()  { return turnInvert ? 115 : 125; }
+
+// Fine-aim while HOLDing: same right/left dir pins as rightTurnCode()/
+// leftTurnCode() (11-20 mirrors 31-40, 21-30 mirrors 41-50), but the
+// shared drive/navigation turn codes rather than the follow-me-only ones —
+// used only for the small in-place nudges below, never for driving.
+static int holdRightTurnCode() { return turnInvert ? 21 : 11; }
+static int holdLeftTurnCode()  { return turnInvert ? 11 : 21; }
 
 static bool proximityBlocked()
 {
@@ -341,12 +352,17 @@ void Follow_Update()
         return;
     }
 
-    // Hard proximity stop (safety backstop, tighter than arrival).
+    // Hard proximity stop (safety backstop, tighter than arrival). Only
+    // hard-returns on the transition into HOLD — once already HOLDing, it
+    // falls through to the switch below so the fine-aim in-place rotation
+    // can still run. That's safe even this close: 11-20/21-30 are pure
+    // point-turns, they don't translate the robot toward whatever tripped
+    // the proximity stop.
     if (proximityBlocked())
     {
-        motion(0);
         if (state != FOLLOW_HOLD)
         {
+            motion(0);
             float nr = (rawA < rawB) ? rawA : rawB;
             if (rawC > 0.0f && rawC < nr)
                 nr = rawC;
@@ -356,8 +372,8 @@ void Follow_Update()
             Serial.print(nr, 2);
             Serial.println(" m");
             state = FOLLOW_HOLD;
+            return;
         }
-        return;
     }
 
     if (followDebug)
@@ -420,15 +436,26 @@ void Follow_Update()
     }
 
     // ── HOLD: arrived or proximity latched ──
-    // If the beacon moves away again (A > arrivalRange), resume.
+    // If the beacon moves away again (A > arrivalRange), resume. Otherwise
+    // fine-aim in place: rotate (never drive) toward whichever of B/C is
+    // smaller — same rule as TURN — until A is the closest anchor, so the
+    // robot ends up pointed as directly at the beacon as an in-place turn
+    // allows, without moving toward it.
     case FOLLOW_HOLD:
     {
-        motion(0);
         if (!hasArrived() && !proximityBlocked())
         {
             Serial.println("FOLLOW: beacon moved away — resuming");
             state = FOLLOW_TURN;
+            break;
         }
+
+        if (frontIsClosest())
+            motion(0);
+        else if (emaB < emaC)
+            motion(holdRightTurnCode());
+        else
+            motion(holdLeftTurnCode());
         break;
     }
 
