@@ -30,6 +30,7 @@ static bool commandStarted = false;
 static float startDistance = 0.0f;
 static float startHeading = 0.0f;
 static float plannedTurnDelta = 0.0f; // used by CMD_TURN_TO_ABS
+static float turnAccum = 0.0f;        // signed degrees turned so far (CMD_LEFT/RIGHT)
 
 // ─── Tuning ────────────────────────────────────────────
 
@@ -56,6 +57,17 @@ static void resetCommandState()
     startDistance = 0.0f;
     startHeading = 0.0f;
     plannedTurnDelta = 0.0f;
+    turnAccum = 0.0f;
+}
+
+// Degrees turned so far in the current L/R command, whichever way the IMU
+// counts. Summing tick-to-tick changes means it never wraps at ±180, so
+// L90 stops at 90 and L270 at 270. startHeading holds the previous tick.
+static float turnedSoFar()
+{
+    turnAccum += normalizeAngle(currentHeading - startHeading);
+    startHeading = currentHeading;
+    return fabs(turnAccum);
 }
 
 // Advance to the next queued command
@@ -361,7 +373,7 @@ void Drive_Update()
             Serial.println(" deg");
         }
         
-        float delta = normalizeAngle(currentHeading - startHeading);
+        float delta = turnedSoFar();
         float remaining = cmd.value - delta;
 
         if (remaining <= TURN_TOLERANCE)
@@ -400,7 +412,7 @@ void Drive_Update()
             Serial.println(" deg");
         }
 
-        float delta = normalizeAngle(currentHeading - startHeading);
+        float delta = turnedSoFar();
         float remaining = cmd.value - delta;
 
         if (remaining <= TURN_TOLERANCE)

@@ -566,8 +566,8 @@ void loop()
     {
       bnoPrintTimer = millis();
 
-      Serial.print(data);
-      Serial.println(" | ");
+      // Serial.print(data);
+      // Serial.println(" | ");
 
       // Serial.print(" | Dist=");
       // Serial.print(distance.travelled, 3);
