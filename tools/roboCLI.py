@@ -72,16 +72,190 @@ def setup_utf8_locale():
 setup_utf8_locale()
 
 
+# ---- Drive task tracker ----
+
+class DriveTracker:
+    """
+    Parses DRIVE: serial messages from the Teensy and renders a live
+    segment progress bar in the terminal.
+
+    Example display for  T:L90,F2,R90,S  while executing F2:
+
+        [L90 OK] [> F2] [R90 ...] [S ...]
+    """
+
+    # States for the overall task lifecycle
+    IDLE      = 0
+    RUNNING   = 1
+    COMPLETE  = 2
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.segments = []              # e.g. ["L90", "F2", "R90", "S"]
+        self.total: int = 0
+        self.current_idx: int = -1          # index into segments (-1 = not started)
+        self.state: int = self.IDLE
+        self.completed_once: bool = False   # has the full task finished at least once?
+        self._lock = threading.Lock()
+
+    def set_task(self, framed: str):
+        """Called when a new task string (e.g. 'T:L90,F2,R90,S') is sent."""
+        with self._lock:
+            raw = framed
+            if raw.upper().startswith("T:"):
+                raw = raw[2:]
+            self.segments = [t.strip() for t in raw.split(",") if t.strip()]
+            self.total = len(self.segments)
+            self.current_idx = -1
+            self.state = self.IDLE
+            self.completed_once = False
+
+    def feed_line(self, line):
+        """
+        Feed a serial line from the Teensy.  Returns a special event
+        string when interesting state changes happen, or None.
+
+        Events: "task_complete"
+        """
+        stripped = line.strip()
+
+        with self._lock:
+            # --- Task queued (first command about to start) ---
+            if stripped.startswith("DRIVE: Queued"):
+                self.state = self.RUNNING
+                self.current_idx = -1
+                return None
+
+            # --- A new command started ---
+            if self._is_command_start(stripped):
+                if self.current_idx < self.total - 1:
+                    self.current_idx += 1
+
+                # CMD_STOP is instantaneous -- the Teensy never prints
+                # "Task complete" for it (it bypasses advanceQueue),
+                # so treat it as both the start and the finish.
+                if stripped == "DRIVE: Stop":
+                    self.state = self.COMPLETE
+                    self.completed_once = True
+                    self._print_bar()
+                    print()  # newline after final bar
+                    return "task_complete"
+
+                self._print_bar()
+                return None
+
+            # --- Settling between commands ---
+            if "Settling between commands" in stripped:
+                self._print_bar(settling=True)
+                return None
+
+            # --- Settle complete ---
+            if "Settle complete" in stripped:
+                return None
+
+            # --- A command finished ---
+            if self._is_command_done(stripped):
+                self._print_bar()
+                return None
+
+            # --- Entire task complete ---
+            if stripped == "DRIVE: Task complete":
+                self.state = self.COMPLETE
+                self.completed_once = True
+                self._print_bar()
+                print()  # newline after final bar
+                return "task_complete"
+
+            # --- Task cancelled ---
+            if "Task cancelled" in stripped:
+                self.state = self.IDLE
+                return None
+
+        return None
+
+    # ---- Internal helpers ----
+
+    _CMD_START_PATTERNS = [
+        "DRIVE: Forward ",
+        "DRIVE: Backward ",
+        "DRIVE: Left ",
+        "DRIVE: Right ",
+        "DRIVE: TurnToAbs ",
+        "DRIVE: Stop",
+    ]
+
+    _CMD_DONE_PATTERNS = [
+        "DRIVE: Forward done",
+        "DRIVE: Backward done",
+        "DRIVE: Left done",
+        "DRIVE: Right done",
+        "DRIVE: TurnToAbs done",
+    ]
+
+    def _is_command_start(self, line: str) -> bool:
+        return any(line.startswith(p) for p in self._CMD_START_PATTERNS)
+
+    def _is_command_done(self, line: str) -> bool:
+        return any(line.startswith(p) for p in self._CMD_DONE_PATTERNS)
+
+    def _print_bar(self, settling: bool = False):
+        """Render the segment bar on a single overwritten line."""
+        if not self.segments:
+            return
+
+        parts = []
+        for i, seg in enumerate(self.segments):
+            if i < self.current_idx:
+                # completed segment
+                parts.append(f"\033[32m{seg} OK\033[0m")
+            elif i == self.current_idx:
+                if self.state == self.COMPLETE:
+                    # final segment just completed
+                    parts.append(f"\033[32m{seg} OK\033[0m")
+                elif settling:
+                    # this segment done, settling before next
+                    parts.append(f"\033[32m{seg} OK\033[0m")
+                else:
+                    # actively running
+                    parts.append(f"\033[33m> {seg}\033[0m")
+            else:
+                # pending
+                parts.append(f"\033[90m{seg} ...\033[0m")
+
+        bar = "  [" + "] [".join(parts) + "]"
+
+        # Overwrite current line
+        print(f"\r\033[K{bar}", end="", flush=True)
+
+
 # ---- Serial reader thread ----
 
-def reader_thread(ser: serial.Serial, stop_event: threading.Event):
+def reader_thread(ser: serial.Serial, stop_event: threading.Event,
+                  tracker: DriveTracker, task_done_event: threading.Event):
     """Continuously read and print serial output from the Teensy."""
     while not stop_event.is_set():
         try:
             if ser.in_waiting:
                 line = ser.readline().decode("utf-8", errors="replace").rstrip()
                 if line:
-                    print("  <- " + line)
+                    # Let the tracker parse DRIVE: messages
+                    event = None
+                    if line.startswith("DRIVE:"):
+                        event = tracker.feed_line(line)
+
+                    # Print all serial lines normally (on a fresh line so the
+                    # progress bar doesn't get trampled)
+                    if tracker.state == tracker.RUNNING:
+                        # Clear bar, print the serial line, then re-draw bar
+                        print(f"\r\033[K  <- {line}")
+                        tracker._print_bar()
+                    else:
+                        print("  <- " + line)
+
+                    if event == "task_complete":
+                        task_done_event.set()
             else:
                 time.sleep(0.01)
         except (serial.SerialException, OSError):
@@ -124,6 +298,90 @@ def frame_task(text: str) -> str:
     return "T:" + ",".join(tokens)
 
 
+# ---- Post-completion prompt ----
+
+def post_task_prompt(ser: serial.Serial, framed: str, tracker: DriveTracker,
+                     task_done_event: threading.Event, robot_locked: bool,
+                     drive_paused: bool) -> bool:
+    """
+    After a task completes once, offer the user the choice to rerun, loop,
+    or continue.  Returns True if the user picked 'loop' (caller should keep
+    looping), False otherwise.
+
+    Called from the main REPL thread.
+    """
+    print()
+    print("  \033[36m+-------------------------------------+\033[0m")
+    print("  \033[36m|\033[0m  Task complete.                     \033[36m|\033[0m")
+    print("  \033[36m|\033[0m    [r] Rerun once                   \033[36m|\033[0m")
+    print("  \033[36m|\033[0m    [l] Loop continuously (Ctrl-C)   \033[36m|\033[0m")
+    print("  \033[36m|\033[0m    [Enter] Continue                 \033[36m|\033[0m")
+    print("  \033[36m+-------------------------------------+\033[0m")
+
+    try:
+        choice = input("  choice> ").strip().lower()
+    except EOFError:
+        return False
+
+    if choice == "r":
+        if robot_locked:
+            print("  ! EMERGENCY LATCHED -- rerun blocked.")
+            return False
+        if drive_paused:
+            print("  ! PAUSED -- rerun blocked. Send 'p' to resume first.")
+            return False
+        task_done_event.clear()
+        tracker.set_task(framed)
+        ser.write((framed + "\n").encode("utf-8"))
+        print("  -> (rerun) " + framed)
+        return False
+
+    elif choice == "l":
+        if robot_locked:
+            print("  ! EMERGENCY LATCHED -- loop blocked.")
+            return False
+        if drive_paused:
+            print("  ! PAUSED -- loop blocked. Send 'p' to resume first.")
+            return False
+        return True  # caller will handle the loop
+
+    # Any other key (including Enter) => continue to normal REPL
+    return False
+
+
+def run_loop(ser: serial.Serial, framed: str, tracker: DriveTracker,
+             task_done_event: threading.Event, stop_event: threading.Event,
+             robot_locked_ref: list):
+    """
+    Continuously rerun the task until Ctrl-C.
+    robot_locked_ref is a single-element list so we can read the live value.
+    """
+    iteration = 1
+    print(f"\n  \033[35m*  LOOPING\033[0m  {framed}  (Ctrl-C to stop)\n")
+    try:
+        while not stop_event.is_set():
+            task_done_event.clear()
+            tracker.set_task(framed)
+            ser.write((framed + "\n").encode("utf-8"))
+            print(f"\n  \033[35m-- loop #{iteration} --\033[0m")
+            iteration += 1
+
+            # Wait for this iteration to finish
+            while not task_done_event.is_set() and not stop_event.is_set():
+                time.sleep(0.05)
+
+            if stop_event.is_set():
+                break
+
+            # Brief pause between iterations
+            time.sleep(0.3)
+
+    except KeyboardInterrupt:
+        print(f"\n  \033[35m*  Loop stopped after {iteration - 1} iteration(s).\033[0m")
+        # Send stop to kill any in-progress task
+        ser.write(b"T:S\n")
+
+
 # ---- Main REPL ----
 
 def find_serial_port(baud: int) -> serial.Serial:
@@ -153,15 +411,24 @@ def main():
 
     print("Ready @ " + str(baud) + " baud.  Type commands or 'quit' to exit.\n")
 
+    # Drive task tracker
+    tracker = DriveTracker()
+    task_done_event = threading.Event()
+
     # Start background reader
     stop_event = threading.Event()
-    reader = threading.Thread(target=reader_thread, args=(ser, stop_event), daemon=True)
+    reader = threading.Thread(
+        target=reader_thread,
+        args=(ser, stop_event, tracker, task_done_event),
+        daemon=True,
+    )
     reader.start()
 
     robot_locked = False
-    last_track: str | None = None  # last successfully sent drive task
-    debug_on = False               # tracks whether live odometry stream is active
-    drive_paused = False           # mirrors the Teensy's drive-pause state
+    robot_locked_ref = [False]      # mutable ref for run_loop
+    last_track = None               # last successfully sent drive task
+    debug_on = False                # tracks whether live odometry stream is active
+    drive_paused = False            # mirrors the Teensy's drive-pause state
 
     try:
         while True:
@@ -197,6 +464,7 @@ def main():
                     time.sleep(0.05)
                     ser.write(b"0\n")     # zero manual motor command
                     robot_locked = True
+                    robot_locked_ref[0] = True
                 else:
                     print("  [UNLATCH] Running CAN latch command in background...")
                     try:
@@ -209,6 +477,7 @@ def main():
                         print("  Error spawning CAN latch command: " + str(e))
 
                     robot_locked = False
+                    robot_locked_ref[0] = False
                 continue
 
             # ---- Single-char Teensy commands (m, s) ----
@@ -318,8 +587,24 @@ def main():
                 elif drive_paused:
                     print("  ! PAUSED -- track discarded. Send 'p' to resume first.")
                 else:
+                    task_done_event.clear()
+                    tracker.set_task(last_track)
                     ser.write((last_track + "\n").encode("utf-8"))
                     print("  -> (repeat) " + last_track)
+
+                    # Wait for completion so we can offer rerun/loop
+                    while not task_done_event.is_set():
+                        time.sleep(0.05)
+
+                    if tracker.completed_once:
+                        do_loop = post_task_prompt(
+                            ser, last_track, tracker, task_done_event,
+                            robot_locked, drive_paused,
+                        )
+                        if do_loop:
+                            run_loop(ser, last_track, tracker,
+                                     task_done_event, stop_event,
+                                     robot_locked_ref)
                 continue
 
             # ---- Task command (drive sequence) ----
@@ -331,9 +616,24 @@ def main():
                     print("  ! PAUSED -- track discarded. Send 'p' to resume first.")
                     continue
                 framed = frame_task(user_input)
+                task_done_event.clear()
+                tracker.set_task(framed)
                 ser.write((framed + "\n").encode("utf-8"))
                 print("  -> " + framed)
                 last_track = framed
+
+                # Wait for the task to complete so we can offer rerun/loop
+                while not task_done_event.is_set():
+                    time.sleep(0.05)
+
+                if tracker.completed_once:
+                    do_loop = post_task_prompt(
+                        ser, framed, tracker, task_done_event,
+                        robot_locked, drive_paused,
+                    )
+                    if do_loop:
+                        run_loop(ser, framed, tracker, task_done_event,
+                                 stop_event, robot_locked_ref)
                 continue
 
             # ---- Numeric motion command ----
