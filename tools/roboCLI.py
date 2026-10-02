@@ -22,15 +22,12 @@ Commands:
     debug       => Toggle live X / Y / heading stream (every 200 ms)
     1 / 15 / 0  => Sends the numeric command as-is
     m / s       => Sends the single-char Teensy command
-    follow      => AIM at the beacon and hold (this build NEVER drives)
+    follow      => FOLLOW-ME: robot autonomously follows the beacon you carry
     followstop  => Stop follow-me
     followmon   => Toggle live beacon readout with motors idle (safe bring-up)
     followcfg   => Print follow-me configuration + current beacon fix
-    followrev   => Invert which way "right"/"left" spins the motors
-    followfb    => Invert the front/back sense (if front reads as behind)
-    followtri   => Toggle THRESHOLD vs TRILATERATION+45deg-sector method
-    followm <m> => Comparison noise margin in metres (default 0.15)
-    followp <m> => Hard stop when any raw anchor reads under <m> (default 0.70)
+    followd <m> => Set A<->B anchor spacing in metres (default 0.545)
+    followr <m> => Set standoff: how far in front of you it stops (default 1.20)
     p           => Toggle drive PAUSE / RESUME
                    First 'p'  => pauses (motors stop, task frozen)
                    Second 'p' => resumes (motors restart, task continues)
@@ -198,12 +195,6 @@ def main():
                     # Cancel any running autonomous track, then stop manual motors
                     ser.write(b"T:S\n")   # abort drive task queue on Teensy
                     time.sleep(0.05)
-                    # Follow-me drives motion() directly and ignores manual
-                    # data while running, so neither "T:S" nor "0" below can
-                    # stop it -- it needs its own cancel or the latch would
-                    # engage while the firmware kept commanding motion.
-                    ser.write(b"followstop\n")
-                    time.sleep(0.05)
                     ser.write(b"0\n")     # zero manual motor command
                     robot_locked = True
                 else:
@@ -281,7 +272,7 @@ def main():
             # followmon/followcfg/followdbg are read-only, so they stay
             # available even while latched -- being able to look at the beacon
             # fix without arming the motors is the whole point of monitor mode.
-            if lower in ("followmon", "followcfg", "followdbg", "followrev", "followfb", "followtri"):
+            if lower in ("followmon", "followcfg", "followdbg"):
                 ser.write((lower + "\n").encode("utf-8"))
                 print("  -> " + lower)
                 continue
@@ -311,8 +302,8 @@ def main():
                 print("  -> followstop")
                 continue
 
-            # followm/followp <m> -- tuning values
-            m_follow = re.match(r"^(followm|followp)\s+([0-9]*\.?[0-9]+)$", lower)
+            # followd <m> / followr <m>  -- anchor spacing / standoff range
+            m_follow = re.match(r"^(followd|followr)\s+([0-9]*\.?[0-9]+)$", lower)
             if m_follow:
                 ser.write((m_follow.group(1) + " " + m_follow.group(2) + "\n").encode("utf-8"))
                 print("  -> " + m_follow.group(1) + " " + m_follow.group(2))

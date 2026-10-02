@@ -16,6 +16,7 @@ enum DriveState
 {
     DRIVE_IDLE,
     DRIVE_RUNNING,
+    DRIVE_SETTLING,  // brief cooldown between non-continuous commands
     DRIVE_COMPLETE
 };
 
@@ -24,6 +25,10 @@ static DriveState state = DRIVE_IDLE;
 // ─── Pause state ──────────────────────────────────────
 static bool drivePaused = false;
 static int  pausedData  = 0;   // manual motion command saved at pause time
+
+// Settling (cooldown between non-continuous commands)
+static const unsigned long SETTLE_DURATION_MS = 300; // ms to hold motors at 0 between unlike commands
+static unsigned long settleStartTime = 0;
 
 // Per-command one-shot capture flag
 static bool commandStarted = false;
@@ -50,6 +55,28 @@ static float normalizeAngle(float angle)
     return angle;
 }
 
+// Two consecutive commands are "continuous" (no settling needed) when they
+// share the same motion category.  Categories:
+//   linear   — CMD_FORWARD, CMD_BACKWARD  (motors already spinning the right way)
+//   turn     — CMD_LEFT, CMD_RIGHT        (both are in-place rotations)
+// Any other transition (turn→linear, linear→turn, or involving STOP/
+// TURN_TO_ABS) is non-continuous and needs a brief motor cooldown so
+// motion.cpp's start-ramp fires properly on the next command.
+static bool isContinuousTransition(DriveCommandType prev, DriveCommandType next)
+{
+    // linear → linear
+    if ((prev == CMD_FORWARD || prev == CMD_BACKWARD) &&
+        (next == CMD_FORWARD || next == CMD_BACKWARD))
+        return true;
+
+    // turn → turn (includes CMD_TURN_TO_ABS)
+    if ((prev == CMD_LEFT || prev == CMD_RIGHT || prev == CMD_TURN_TO_ABS) &&
+        (next == CMD_LEFT || next == CMD_RIGHT || next == CMD_TURN_TO_ABS))
+        return true;
+
+    return false;
+}
+
 // Reset all per-command tracking state
 static void resetCommandState()
 {
@@ -70,9 +97,14 @@ static float turnedSoFar()
     return fabs(turnAccum);
 }
 
-// Advance to the next queued command
+// Advance to the next queued command.  If the upcoming command is a
+// different motion category (non-continuous), enter a brief settling
+// period first so the motors fully stop and motion.cpp's lastCommand
+// resets to 0 — this lets the start-ramp fire for the next command
+// instead of jumping straight to full PWM.
 static void advanceQueue()
 {
+    DriveCommandType finishedType = queue[queueIndex].type;
     resetCommandState();
     queueIndex++;
 
@@ -82,6 +114,19 @@ static void advanceQueue()
         motion(0);
         state = DRIVE_IDLE;
         Serial.println("DRIVE: Task complete");
+        return;
+    }
+
+    // Check if the transition to the next command is continuous
+    DriveCommandType nextType = queue[queueIndex].type;
+
+    if (!isContinuousTransition(finishedType, nextType))
+    {
+        // Non-continuous: settle motors before starting the next command
+        motion(0);
+        settleStartTime = millis();
+        state = DRIVE_SETTLING;
+        Serial.println("DRIVE: Settling between commands (300 ms)");
     }
 }
 
@@ -97,12 +142,12 @@ void Drive_Init()
 
 bool Drive_IsRunning()
 {
-    return (state == DRIVE_RUNNING);
+    return (state == DRIVE_RUNNING || state == DRIVE_SETTLING);
 }
 
 void Drive_Cancel()
 {
-    if (state == DRIVE_RUNNING)
+    if (state == DRIVE_RUNNING || state == DRIVE_SETTLING)
     {
         motion(0); // Ensure motors are stopped
         queueLength = 0;
@@ -289,6 +334,19 @@ void Drive_Update()
     if (drivePaused)
     {
         motion(0); // actively flush ramp state every tick
+        return;
+    }
+
+    // ── SETTLING: hold motors at zero for SETTLE_DURATION_MS ──
+    if (state == DRIVE_SETTLING)
+    {
+        motion(0); // keep flushing ramp state every tick
+
+        if (millis() - settleStartTime >= SETTLE_DURATION_MS)
+        {
+            state = DRIVE_RUNNING;
+            Serial.println("DRIVE: Settle complete, next command");
+        }
         return;
     }
 
