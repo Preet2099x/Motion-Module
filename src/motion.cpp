@@ -76,6 +76,36 @@ int applyStartRamp(int targetPWM, int currentCommand)
   return targetPWM;
 }
 
+// Arc (111-130) -> 1 transition ramp. applyStartRamp() only covers 0 -> 1/2,
+// so without this the first tick after an arc snaps both sides to full
+// forward PWM. Each side glides from where the arc left it to the target.
+static const unsigned long ARC_EXIT_RAMP_MS = 300;
+static bool arcExitRampActive = false;
+static unsigned long arcExitRampStart = 0;
+static int arcExitStartL = 0;
+static int arcExitStartR = 0;
+
+static void applyArcExitRamp(int targetPWM, int &pwmL, int &pwmR)
+{
+  pwmL = targetPWM;
+  pwmR = targetPWM;
+
+  if (!arcExitRampActive)
+    return;
+
+  unsigned long elapsed = millis() - arcExitRampStart;
+
+  if (elapsed >= ARC_EXIT_RAMP_MS)
+  {
+    arcExitRampActive = false;
+    return;
+  }
+
+  float t = (float)elapsed / ARC_EXIT_RAMP_MS;
+  pwmL = arcExitStartL + (int)((targetPWM - arcExitStartL) * t);
+  pwmR = arcExitStartR + (int)((targetPWM - arcExitStartR) * t);
+}
+
 static int applyRamp(int current, int target, int step)
 {
   if (current > target)
@@ -184,6 +214,7 @@ void motion(int _data)
 
     rampActive = false;
     rampCommand = 0;
+    arcExitRampActive = false;
 
     static unsigned long rampDownTimer = 0;
     if (millis() - rampDownTimer >= 5) // 5ms tick — tune this
@@ -244,9 +275,26 @@ void motion(int _data)
     digitalWrite(dirPin_R, LOW);
     digitalWrite(dirPin_L, LOW);
 
+    // Arc (111-130) -> 1: currentPwmL/R still hold the arc's values here, so
+    // capture them as the ramp start instead of snapping to full forward PWM.
+    if (lastCommand >= 111 && lastCommand <= 130)
+    {
+      arcExitRampStart = millis();
+      arcExitStartL = currentPwmL;
+      arcExitStartR = currentPwmR;
+      arcExitRampActive = true;
+    }
+    else if (lastCommand != 1)
+    {
+      arcExitRampActive = false;
+    }
+
     int pwm = applyStartRamp(
         straightBoost ? 255 : 200,
         _data);
+
+    int pwmL, pwmR;
+    applyArcExitRamp(pwm, pwmL, pwmR);
 
     if (!headingHoldActive)
     {
@@ -282,8 +330,8 @@ void motion(int _data)
         pidError = error;
         pidCorrection = correction;
 
-        currentPwmL = constrain(pwm + correction, 0, 255);
-        currentPwmR = constrain(pwm - correction, 0, 255);
+        currentPwmL = constrain(pwmL + correction, 0, 255);
+        currentPwmR = constrain(pwmR - correction, 0, 255);
 
         debugPwmL = currentPwmL;
         debugPwmR = currentPwmR;
@@ -294,8 +342,8 @@ void motion(int _data)
     }
     else
     {
-      currentPwmL = pwm;
-      currentPwmR = pwm;
+      currentPwmL = pwmL;
+      currentPwmR = pwmR;
 
       debugPwmL = currentPwmL;
       debugPwmR = currentPwmR;

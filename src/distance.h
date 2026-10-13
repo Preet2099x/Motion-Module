@@ -10,6 +10,7 @@ struct DistanceData
 
 extern DistanceData distance;
 
-void Distance_Init();
+
+void Distance_Init();                   
 void Distance_Reset();
 void Distance_Update(long leftTicks, long rightTicks);

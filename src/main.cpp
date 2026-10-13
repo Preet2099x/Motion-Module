@@ -566,8 +566,8 @@ void loop()
     {
       bnoPrintTimer = millis();
 
-      // Serial.print(data);
-      // Serial.println(" | ");
+      Serial.print(data);
+      Serial.print(" | ");
 
       // Serial.print(" | Dist=");
       // Serial.print(distance.travelled, 3);
@@ -606,17 +606,17 @@ void loop()
 
       // Serial.println(" rad");
 
-      // Serial.print(" Heading=");
-      // Serial.println(currentHeading);
+      Serial.print(" Heading=");
+      Serial.print(currentHeading);
 
-      // Serial.print(" | Target=");
-      // Serial.print(targetHeading);
+      Serial.print(" | Target=");
+      Serial.print(targetHeading);
 
-      // Serial.print(" | Error=");
-      // Serial.print(pidError);
+      Serial.print(" | Error=");
+      Serial.print(pidError);
 
-      // Serial.print(" | Corr=");
-      // Serial.print(pidCorrection);
+      Serial.print(" | Corr=");
+      Serial.print(pidCorrection);
 
       // // Serial.print(" | L=");
       // // Serial.print(debugPwmL);
@@ -624,8 +624,8 @@ void loop()
       // // Serial.print(" | R=");
       // // Serial.print(debugPwmR);
 
-      // Serial.print(" | I=");
-      // Serial.println(headingIntegral);
+      Serial.print(" | I=");
+      Serial.println(headingIntegral);
     }
   }
 
