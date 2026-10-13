@@ -1,10 +1,7 @@
 #include <var.h>
 #include <Arduino.h>
 
-static unsigned long rampStartTime = 0;
-static bool rampActive = false;
 static int lastCommand = 0;
-static int rampCommand = 0;
 
 static int currentPwmL = 0;
 static int currentPwmR = 0;
@@ -43,67 +40,53 @@ const float KdB = 0.08f;
 int debugPwmL = 0;
 int debugPwmR = 0;
 
-int applyStartRamp(int targetPWM, int currentCommand)
+// Speed ramp for 1/2, keyed to the PWM actually on the motors, not to how long
+// the command has been held. Each side's base speed is rate-limited toward the
+// target, and it is (re)anchored to currentPwmL/R whenever 1/2 starts afresh
+// (after 0, a turn, an arc, ...). A stick flick that sends 1,0,1,0... therefore
+// resumes from wherever the motors are instead of restarting - or skipping -
+// the ramp, which is what made it jump straight to full PWM.
+static const float RAMP_START_PWM = 30.0f;     // floor when starting from rest
+static const float RAMP_RATE = 0.15f;          // PWM per ms (~1.5 s for 30 -> 255)
+static const float RAMP_RATE_ARC_EXIT = 0.85f; // PWM per ms (~300 ms for 0 -> 255)
+
+static bool rampHeld = false;     // true while 1/2 is being driven continuously
+static bool cameFromArc = false;  // last non-1/2 command was an arc (111-130)
+static float rampL = 0;
+static float rampR = 0;
+static float rampRate = RAMP_RATE;
+static unsigned long rampLastTick = 0;
+
+static float approachTarget(float value, float target, float step)
 {
-  if (rampActive && currentCommand == rampCommand)
-  {
-    unsigned long elapsed = millis() - rampStartTime;
-
-    if (elapsed >= 1500)
-    {
-      rampActive = false;
-      return targetPWM;
-    }
-
-    float t = elapsed / 1500.0f;
-
-    // cubic smoothstep
-    float smooth = t * t * (3.0f - 2.0f * t);
-
-    return 30 + (targetPWM - 30) * smooth;
-  }
-
-  if (lastCommand == 0 &&
-      (currentCommand == 1 || currentCommand == 2))
-  {
-    rampStartTime = millis();
-    rampCommand = currentCommand;
-    rampActive = true;
-
-    return 30;
-  }
-
-  return targetPWM;
+  if (value < target)
+    return min(value + step, target);
+  return max(value - step, target);
 }
 
-// Arc (111-130) -> 1 transition ramp. applyStartRamp() only covers 0 -> 1/2,
-// so without this the first tick after an arc snaps both sides to full
-// forward PWM. Each side glides from where the arc left it to the target.
-static const unsigned long ARC_EXIT_RAMP_MS = 300;
-static bool arcExitRampActive = false;
-static unsigned long arcExitRampStart = 0;
-static int arcExitStartL = 0;
-static int arcExitStartR = 0;
-
-static void applyArcExitRamp(int targetPWM, int &pwmL, int &pwmR)
+// Outputs the pre-PID base PWM for each side (the heading PID adds its
+// correction on top of these).
+static void applySpeedRamp(int targetPWM, int &pwmL, int &pwmR)
 {
-  pwmL = targetPWM;
-  pwmR = targetPWM;
+  unsigned long now = millis();
 
-  if (!arcExitRampActive)
-    return;
-
-  unsigned long elapsed = millis() - arcExitRampStart;
-
-  if (elapsed >= ARC_EXIT_RAMP_MS)
+  if (!rampHeld)
   {
-    arcExitRampActive = false;
-    return;
+    rampL = max((float)currentPwmL, RAMP_START_PWM);
+    rampR = max((float)currentPwmR, RAMP_START_PWM);
+    rampRate = cameFromArc ? RAMP_RATE_ARC_EXIT : RAMP_RATE;
+    rampLastTick = now;
+    rampHeld = true;
   }
 
-  float t = (float)elapsed / ARC_EXIT_RAMP_MS;
-  pwmL = arcExitStartL + (int)((targetPWM - arcExitStartL) * t);
-  pwmR = arcExitStartR + (int)((targetPWM - arcExitStartR) * t);
+  float step = rampRate * (float)(now - rampLastTick);
+  rampLastTick = now;
+
+  rampL = approachTarget(rampL, (float)targetPWM, step);
+  rampR = approachTarget(rampR, (float)targetPWM, step);
+
+  pwmL = (int)rampL;
+  pwmR = (int)rampR;
 }
 
 static int applyRamp(int current, int target, int step)
@@ -173,6 +156,15 @@ void motion(int _data)
   if (_data == 274)
     _data = 225;
 
+  // Anything other than 1/2 ends a held ramp, so the next 1/2 re-anchors to the
+  // PWM on the motors. 0 clears cameFromArc so arc -> release -> 1 uses the
+  // normal rate, from the decayed PWM.
+  if (_data != 1 && _data != 2)
+  {
+    rampHeld = false;
+    cameFromArc = (_data >= 111 && _data <= 130);
+  }
+
   // --- Kill motor on direction switch (1->2 or 2->1) ---
   if ((_data == 1 && lastCommand == 2) || (_data == 2 && lastCommand == 1))
   {
@@ -194,8 +186,8 @@ void motion(int _data)
     pidCorrection = 0;
     targetHeading = currentHeading;
 
-    rampActive = false;
-    rampCommand = 0;
+    rampHeld = false;
+    cameFromArc = false;
 
     lastCommand = 0; // reset so next cycle treats it as a fresh start
     return;
@@ -211,10 +203,6 @@ void motion(int _data)
     pidError = 0;
     pidCorrection = 0;
     targetHeading = currentHeading;
-
-    rampActive = false;
-    rampCommand = 0;
-    arcExitRampActive = false;
 
     static unsigned long rampDownTimer = 0;
     if (millis() - rampDownTimer >= 5) // 5ms tick — tune this
@@ -275,26 +263,8 @@ void motion(int _data)
     digitalWrite(dirPin_R, LOW);
     digitalWrite(dirPin_L, LOW);
 
-    // Arc (111-130) -> 1: currentPwmL/R still hold the arc's values here, so
-    // capture them as the ramp start instead of snapping to full forward PWM.
-    if (lastCommand >= 111 && lastCommand <= 130)
-    {
-      arcExitRampStart = millis();
-      arcExitStartL = currentPwmL;
-      arcExitStartR = currentPwmR;
-      arcExitRampActive = true;
-    }
-    else if (lastCommand != 1)
-    {
-      arcExitRampActive = false;
-    }
-
-    int pwm = applyStartRamp(
-        straightBoost ? 255 : 200,
-        _data);
-
     int pwmL, pwmR;
-    applyArcExitRamp(pwm, pwmL, pwmR);
+    applySpeedRamp(straightBoost ? 255 : 200, pwmL, pwmR);
 
     if (!headingHoldActive)
     {
@@ -358,9 +328,8 @@ void motion(int _data)
     digitalWrite(dirPin_R, HIGH);
     digitalWrite(dirPin_L, HIGH);
 
-    int pwm = applyStartRamp(
-        straightBoost ? 255 : 200,
-        _data);
+    int pwmL, pwmR;
+    applySpeedRamp(straightBoost ? 255 : 200, pwmL, pwmR);
 
     if (!headingHoldActive)
     {
@@ -396,8 +365,8 @@ void motion(int _data)
         pidError = error;
         pidCorrection = correction;
 
-        currentPwmL = constrain(pwm - correction, 0, 255);
-        currentPwmR = constrain(pwm +2 + correction, 0, 255);
+        currentPwmL = constrain(pwmL - correction, 0, 255);
+        currentPwmR = constrain(pwmR + 2 + correction, 0, 255);
 
         debugPwmL = currentPwmL;
         debugPwmR = currentPwmR;
@@ -408,8 +377,8 @@ void motion(int _data)
     }
     else
     {
-      currentPwmL = pwm;
-      currentPwmR = pwm;
+      currentPwmL = pwmL;
+      currentPwmR = pwmR;
 
       debugPwmL = currentPwmL;
       debugPwmR = currentPwmR;
@@ -779,8 +748,8 @@ void motion_EmergencyStop()
   pidCorrection = 0;
   targetHeading = currentHeading;
 
-  rampActive = false;
-  rampCommand = 0;
+  rampHeld = false;
+  cameFromArc = false;
   lastCommand = 0;
 
   digitalWrite(dirPin_L, LOW);
