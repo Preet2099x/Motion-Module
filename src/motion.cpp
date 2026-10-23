@@ -234,7 +234,7 @@ void motion(int _data)
     return;
   }
 
-  if (_data == 2)
+  if (_data == 1)
   {
 
     digitalWrite(dirPin_R, LOW);
@@ -301,7 +301,7 @@ void motion(int _data)
     analogWrite(pwmPin_L, currentPwmL);
   }
 
-  else if (_data == 1)
+  else if (_data == 2)
   {
     digitalWrite(dirPin_R, HIGH);
     digitalWrite(dirPin_L, HIGH);
@@ -367,7 +367,7 @@ void motion(int _data)
     analogWrite(pwmPin_L, currentPwmL);
   }
 
-  else if (_data >= 11 && _data <= 20)
+  else if (_data >= 21 && _data <= 30)
   {
     headingHoldActive = false;
     headingCaptureStart = 0;
@@ -380,41 +380,6 @@ void motion(int _data)
 
     digitalWrite(dirPin_L, LOW);
     digitalWrite(dirPin_R, HIGH);
-
-    if (_data <= 13)
-    {
-      currentPwmL = turnBoost ? 80 : 60;
-      currentPwmR = turnBoost ? 80 : 60;
-    }
-    else if (_data <= 16)
-    {
-      currentPwmL = turnBoost ? 120 : 80;
-      currentPwmR = turnBoost ? 120 : 80;
-    }
-    else
-    {
-      currentPwmL = turnBoost ? 180 : 120;
-      currentPwmR = turnBoost ? 180 : 120;
-    }
-
-    debugPwmL = currentPwmL;
-    debugPwmR = currentPwmR;
-    analogWrite(pwmPin_L, currentPwmL);
-    analogWrite(pwmPin_R, currentPwmR);
-  }
-
-  else if (_data >= 21 && _data <= 30)
-  {
-    headingHoldActive = false;
-    headingCaptureStart = 0;
-    headingIntegral = 0;
-    previousHeadingError = 0;
-    previousPidTime = 0;
-    pidError = 0;
-    pidCorrection = 0;
-    targetHeading = currentHeading;
-    digitalWrite(dirPin_L, HIGH);
-    digitalWrite(dirPin_R, LOW);
 
     if (_data <= 23)
     {
@@ -434,12 +399,47 @@ void motion(int _data)
 
     debugPwmL = currentPwmL;
     debugPwmR = currentPwmR;
+    analogWrite(pwmPin_L, currentPwmL);
+    analogWrite(pwmPin_R, currentPwmR);
+  }
+
+  else if (_data >= 11 && _data <= 20)
+  {
+    headingHoldActive = false;
+    headingCaptureStart = 0;
+    headingIntegral = 0;
+    previousHeadingError = 0;
+    previousPidTime = 0;
+    pidError = 0;
+    pidCorrection = 0;
+    targetHeading = currentHeading;
+    digitalWrite(dirPin_L, HIGH);
+    digitalWrite(dirPin_R, LOW);
+
+    if (_data <= 13)
+    {
+      currentPwmL = turnBoost ? 80 : 60;
+      currentPwmR = turnBoost ? 80 : 60;
+    }
+    else if (_data <= 16)
+    {
+      currentPwmL = turnBoost ? 120 : 80;
+      currentPwmR = turnBoost ? 120 : 80;
+    }
+    else
+    {
+      currentPwmL = turnBoost ? 180 : 120;
+      currentPwmR = turnBoost ? 180 : 120;
+    }
+
+    debugPwmL = currentPwmL;
+    debugPwmR = currentPwmR;
 
     analogWrite(pwmPin_L, currentPwmL);
     analogWrite(pwmPin_R, currentPwmR);
   }
 
-  else if (_data >= 211 && _data <= 220)
+  else if (_data >= 111 && _data <= 120)
   {
     headingHoldActive = false;
     headingCaptureStart = 0;
@@ -452,12 +452,12 @@ void motion(int _data)
     digitalWrite(dirPin_L, LOW);
     digitalWrite(dirPin_R, LOW);
 
-    if (_data <= 213)
+    if (_data <= 113)
     {
       currentPwmL = straightBoost ? 170 : 125;
       currentPwmR = straightBoost ? 120 : 90;
     }
-    else if (_data <= 216)
+    else if (_data <= 116)
     {
       currentPwmL = straightBoost ? 200 : 150;
       currentPwmR = straightBoost ? 150 : 115;
@@ -466,41 +466,6 @@ void motion(int _data)
     {
       currentPwmL = straightBoost ? 240 : 180;
       currentPwmR = straightBoost ? 80 : 60;
-    }
-
-    debugPwmL = currentPwmL;
-    debugPwmR = currentPwmR;
-    analogWrite(pwmPin_L, currentPwmL);
-    analogWrite(pwmPin_R, currentPwmR);
-  }
-
-  else if (_data >= 221 && _data <= 230)
-  {
-    headingHoldActive = false;
-    headingCaptureStart = 0;
-    headingIntegral = 0;
-    previousHeadingError = 0;
-    previousPidTime = 0;
-    pidError = 0;
-    pidCorrection = 0;
-    targetHeading = currentHeading;
-    digitalWrite(dirPin_L, LOW);
-    digitalWrite(dirPin_R, LOW);
-
-    if (_data <= 223)
-    {
-      currentPwmL = straightBoost ? 120 : 90;
-      currentPwmR = straightBoost ? 170 : 125;
-    }
-    else if (_data <= 226)
-    {
-      currentPwmL = straightBoost ? 150 : 115;
-      currentPwmR = straightBoost ? 200 : 150;
-    }
-    else
-    {
-      currentPwmL = straightBoost ? 80 : 60;
-      currentPwmR = straightBoost ? 240 : 180;
     }
 
     debugPwmL = currentPwmL;
@@ -519,16 +484,51 @@ void motion(int _data)
     pidError = 0;
     pidCorrection = 0;
     targetHeading = currentHeading;
+    digitalWrite(dirPin_L, LOW);
+    digitalWrite(dirPin_R, LOW);
+
+    if (_data <= 123)
+    {
+      currentPwmL = straightBoost ? 120 : 90;
+      currentPwmR = straightBoost ? 170 : 125;
+    }
+    else if (_data <= 126)
+    {
+      currentPwmL = straightBoost ? 150 : 115;
+      currentPwmR = straightBoost ? 200 : 150;
+    }
+    else
+    {
+      currentPwmL = straightBoost ? 80 : 60;
+      currentPwmR = straightBoost ? 240 : 180;
+    }
+
+    debugPwmL = currentPwmL;
+    debugPwmR = currentPwmR;
+    analogWrite(pwmPin_L, currentPwmL);
+    analogWrite(pwmPin_R, currentPwmR);
+  }
+
+  else if (_data >= 211 && _data <= 220)
+  {
+    headingHoldActive = false;
+    headingCaptureStart = 0;
+    headingIntegral = 0;
+    previousHeadingError = 0;
+    previousPidTime = 0;
+    pidError = 0;
+    pidCorrection = 0;
+    targetHeading = currentHeading;
 
     digitalWrite(dirPin_L, HIGH);
     digitalWrite(dirPin_R, HIGH);
 
-    if (_data <= 123)
+    if (_data <= 213)
     {
       currentPwmL = straightBoost ? 170 : 125;
       currentPwmR = straightBoost ? 120 : 90;
     }
-    else if (_data <= 126)
+    else if (_data <= 216)
     {
       currentPwmL = straightBoost ? 200 : 150;
       currentPwmR = straightBoost ? 120 : 90;
@@ -544,7 +544,7 @@ void motion(int _data)
     analogWrite(pwmPin_L, currentPwmL);
     analogWrite(pwmPin_R, currentPwmR);
   }
-  else if (_data >= 111 && _data <= 120)
+  else if (_data >= 221 && _data <= 230)
   {
     headingHoldActive = false;
     headingCaptureStart = 0;
@@ -557,12 +557,12 @@ void motion(int _data)
     digitalWrite(dirPin_L, HIGH);
     digitalWrite(dirPin_R, HIGH);
 
-    if (_data <= 113)
+    if (_data <= 223)
     {
       currentPwmL = straightBoost ? 120 : 90;
       currentPwmR = straightBoost ? 170 : 125;
     }
-    else if (_data <= 116)
+    else if (_data <= 226)
     {
       currentPwmL = straightBoost ? 120 : 90;
       currentPwmR = straightBoost ? 200 : 150;
