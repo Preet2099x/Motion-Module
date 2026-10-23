@@ -541,7 +541,7 @@ def main():
             # followmon/followcfg/followdbg are read-only, so they stay
             # available even while latched -- being able to look at the beacon
             # fix without arming the motors is the whole point of monitor mode.
-            if lower in ("followmon", "followcfg", "followdbg"):
+            if lower in ("followmon", "followcfg", "followdbg", "encscan"):
                 ser.write((lower + "\n").encode("utf-8"))
                 print("  -> " + lower)
                 continue

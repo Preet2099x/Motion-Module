@@ -59,10 +59,10 @@ unsigned int addressTRL = 18;
 unsigned int addressTLR = 20;
 unsigned int addressTLL = 22;
 
-int encoderPin_1_L = 7; // 23
-int encoderPin_2_L = 8; // 22
+int encoderPin_1_L = 8; // 23
+int encoderPin_2_L = 9; // 22
 int encoderPin_1_R = 5; // 14
-int encoderPin_2_R = 4; // 20
+int encoderPin_2_R = 6; // 20
 
 bool turnBoost = false;
 bool straightBoost = false;
@@ -80,6 +80,10 @@ long lastencoderValue_L = 0;
 volatile int lastEncoded_R = 0;
 volatile long encoderValue_R = 0;
 long lastencoderValue_R = 0;
+
+// Running signed tick totals (encoderValue_* is cleared every 100 ms tick)
+long totalTicks_L = 0;
+long totalTicks_R = 0;
 // int lastMSB_R = 0;
 // int lastLSB_R = 0;
 
@@ -554,6 +558,11 @@ void loop()
 
     Odometry_Update();
 
+    // encoderValue_* is zeroed every tick; keep running signed totals for the
+    // debug print (ticks per wheel rev calibration, direction checks).
+    totalTicks_L += encoderValue_L;
+    totalTicks_R += encoderValue_R;
+
     encoderValue_L = encoderValue_R = 0;
 
     Navigation_Update();
@@ -569,14 +578,14 @@ void loop()
       Serial.print(data);
       Serial.print(" | ");
 
-      // Serial.print(" | Dist=");
-      // Serial.print(distance.travelled, 3);
+      Serial.print(" | Dist=");
+      Serial.print(distance.travelled, 3);
 
-      // Serial.print(" | Left =");
-      // Serial.print(distance.left, 3);
+      Serial.print(" | Left =");
+      Serial.print(distance.left, 3);
 
-      // Serial.print(" | Right =");
-      // Serial.println(distance.right, 3);
+      Serial.print(" | Right =");
+      Serial.println(distance.right, 3);
 
       // Serial.print(" | V=");
       // Serial.print(velocity.linear, 3);
@@ -606,26 +615,26 @@ void loop()
 
       // Serial.println(" rad");
 
-      Serial.print(" Heading=");
-      Serial.print(currentHeading);
+      // Serial.print(" Heading=");
+      // Serial.print(currentHeading);
 
-      Serial.print(" | Target=");
-      Serial.print(targetHeading);
+      // Serial.print(" | Target=");
+      // Serial.print(targetHeading);
 
-      Serial.print(" | Error=");
-      Serial.print(pidError);
+      // Serial.print(" | Error=");
+      // Serial.print(pidError);
 
-      Serial.print(" | Corr=");
-      Serial.print(pidCorrection);
+      // Serial.print(" | Corr=");
+      // Serial.print(pidCorrection);
 
-      // // Serial.print(" | L=");
-      // // Serial.print(debugPwmL);
+      // // // Serial.print(" | L=");
+      // // // Serial.print(debugPwmL);
 
-      // // Serial.print(" | R=");
-      // // Serial.print(debugPwmR);
+      // // // Serial.print(" | R=");
+      // // // Serial.print(debugPwmR);
 
-      Serial.print(" | I=");
-      Serial.println(headingIntegral);
+      // Serial.print(" | I=");
+      // Serial.println(headingIntegral);
     }
   }
 
