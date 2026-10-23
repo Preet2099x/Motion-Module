@@ -442,8 +442,10 @@ void motion(int _data)
     pidCorrection = 0;
     targetHeading = currentHeading;
 
-    digitalWrite(dirPin_L, LOW);
-    digitalWrite(dirPin_R, HIGH);
+    // Left/right motors are swapped on this robot, so 11-20 uses the dir
+    // pins that 21-30 used to (and vice versa).
+    digitalWrite(dirPin_L, HIGH);
+    digitalWrite(dirPin_R, LOW);
 
     if (_data <= 13)
     {
@@ -477,8 +479,8 @@ void motion(int _data)
     pidError = 0;
     pidCorrection = 0;
     targetHeading = currentHeading;
-    digitalWrite(dirPin_L, HIGH);
-    digitalWrite(dirPin_R, LOW);
+    digitalWrite(dirPin_L, LOW);
+    digitalWrite(dirPin_R, HIGH);
 
     if (_data <= 23)
     {
@@ -592,20 +594,21 @@ void motion(int _data)
     digitalWrite(dirPin_L, LOW);
     digitalWrite(dirPin_R, LOW);
 
+    // L/R swapped vs. the old robot: 111-120 uses 121-130's old PWM split.
     if (_data <= 113)
     {
-      currentPwmL = straightBoost ? 170 : 125;
-      currentPwmR = straightBoost ? 120 : 90;
+      currentPwmL = straightBoost ? 120 : 90;
+      currentPwmR = straightBoost ? 170 : 125;
     }
     else if (_data <= 116)
     {
-      currentPwmL = straightBoost ? 200 : 150;
-      currentPwmR = straightBoost ? 150 : 115;
+      currentPwmL = straightBoost ? 150 : 115;
+      currentPwmR = straightBoost ? 200 : 150;
     }
     else
     {
-      currentPwmL = straightBoost ? 240 : 180;
-      currentPwmR = straightBoost ? 80 : 60;
+      currentPwmL = straightBoost ? 80 : 60;
+      currentPwmR = straightBoost ? 240 : 180;
     }
 
     debugPwmL = currentPwmL;
@@ -629,18 +632,18 @@ void motion(int _data)
 
     if (_data <= 123)
     {
-      currentPwmL = straightBoost ? 120 : 90;
-      currentPwmR = straightBoost ? 170 : 125;
+      currentPwmL = straightBoost ? 170 : 125;
+      currentPwmR = straightBoost ? 120 : 90;
     }
     else if (_data <= 126)
     {
-      currentPwmL = straightBoost ? 150 : 115;
-      currentPwmR = straightBoost ? 200 : 150;
+      currentPwmL = straightBoost ? 200 : 150;
+      currentPwmR = straightBoost ? 150 : 115;
     }
     else
     {
-      currentPwmL = straightBoost ? 80 : 60;
-      currentPwmR = straightBoost ? 240 : 180;
+      currentPwmL = straightBoost ? 240 : 180;
+      currentPwmR = straightBoost ? 80 : 60;
     }
 
     debugPwmL = currentPwmL;

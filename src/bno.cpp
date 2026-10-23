@@ -3,6 +3,10 @@
 
 #define BNO055_ADDR 0x28
 
+// 1 = mirror the BNO heading (heading falls when the robot turns right).
+// Set to 0 if a robot's IMU/motor wiring already counts the right way.
+#define HEADING_INVERT 1
+
 float currentHeading = 0;
 float imuRoll = 0;
 float imuPitch = 0;
@@ -72,7 +76,15 @@ void bnoStandaloneSetup()
 void bnoStandaloneLoop()
 {
   // Euler angles (deg * 16)
-  currentHeading = read16(0x1A) / 16.0;
+  float rawHeading = read16(0x1A) / 16.0;
+  // Everything (heading PID, Drive turns, Navigation) assumes heading
+  // INCREASES when the left wheel is faster / robot turns right (code 15).
+  // On this robot the BNO counts the other way, so mirror it.
+#if HEADING_INVERT
+  currentHeading = (rawHeading > 0.0f) ? 360.0f - rawHeading : 0.0f;
+#else
+  currentHeading = rawHeading;
+#endif
   float heading = currentHeading;
   float roll = read16(0x1C) / 16.0;
   float pitch = read16(0x1E) / 16.0;
