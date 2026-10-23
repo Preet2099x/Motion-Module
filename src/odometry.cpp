@@ -38,7 +38,11 @@ void Odometry_Update()
     odometry.rawHeading = currentHeading;
 
     // Relative heading (0 after Home)
-    odometry.heading = currentHeading - headingOffset;
+    // Navigation and Drive's TURN_TO_ABS expect this to INCREASE on the
+    // 11-20 turn codes. currentHeading is mirrored by HEADING_INVERT (for the
+    // straight-line PID), which makes it fall on those turns, so mirror it
+    // back here. Only odometry/navigation see this; the PID is unaffected.
+    odometry.heading = headingOffset - currentHeading;
 
     while (odometry.heading >= 360.0f)
         odometry.heading -= 360.0f;

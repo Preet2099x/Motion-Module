@@ -59,8 +59,8 @@ unsigned int addressTRL = 18;
 unsigned int addressTLR = 20;
 unsigned int addressTLL = 22;
 
-int encoderPin_1_L = 8; // 23
-int encoderPin_2_L = 9; // 22
+int encoderPin_1_L = 9; // A/B swapped so the left count matches the right's direction
+int encoderPin_2_L = 8;
 int encoderPin_1_R = 5; // 14
 int encoderPin_2_R = 6; // 20
 
@@ -575,17 +575,17 @@ void loop()
     {
       bnoPrintTimer = millis();
 
-      Serial.print(data);
-      Serial.print(" | ");
+      // Serial.print(data);
+      // Serial.print(" | ");
 
-      Serial.print(" | Dist=");
-      Serial.print(distance.travelled, 3);
+      // Serial.print(" | Dist=");
+      // Serial.print(distance.travelled, 3);
 
-      Serial.print(" | Left =");
-      Serial.print(distance.left, 3);
+      // Serial.print(" | Left =");
+      // Serial.print(distance.left, 3);
 
-      Serial.print(" | Right =");
-      Serial.println(distance.right, 3);
+      // Serial.print(" | Right =");
+      // Serial.println(distance.right, 3);
 
       // Serial.print(" | V=");
       // Serial.print(velocity.linear, 3);
@@ -597,17 +597,23 @@ void loop()
 
       // Serial.println(" rad/s");
 
-      // Serial.print(" D=");
-      // Serial.print(distance.travelled, 3);
+      Serial.print(" D=");
+      Serial.print(distance.travelled, 3);
 
-      // Serial.print(" OD=");
-      // Serial.print(distance.odometryTravelled, 3);
+      Serial.print(" OD=");
+      Serial.print(distance.odometryTravelled, 3);
 
-      // Serial.print(" | X=");
-      // Serial.print(odometry.x, 3);
+      Serial.print(" | X=");
+      Serial.print(odometry.x, 3);
 
-      // Serial.print(" | Y=");
-      // Serial.print(odometry.y, 3);
+      Serial.print(" | Y=");
+      Serial.print(odometry.y, 3);
+
+      Serial.print(" | EncL=");
+      Serial.print(totalTicks_L);
+
+      Serial.print(" | EncR=");
+      Serial.println(totalTicks_R);
 
       // Serial.print(" | H=");
       // Serial.println(odometry.heading, 3);
