@@ -597,23 +597,23 @@ void loop()
 
       // Serial.println(" rad/s");
 
-      Serial.print(" D=");
-      Serial.print(distance.travelled, 3);
+      // Serial.print(" D=");
+      // Serial.print(distance.travelled, 3);
 
-      Serial.print(" OD=");
-      Serial.print(distance.odometryTravelled, 3);
+      // Serial.print(" OD=");
+      // Serial.print(distance.odometryTravelled, 3);
 
-      Serial.print(" | X=");
-      Serial.print(odometry.x, 3);
+      // Serial.print(" | X=");
+      // Serial.print(odometry.x, 3);
 
-      Serial.print(" | Y=");
-      Serial.print(odometry.y, 3);
+      // Serial.print(" | Y=");
+      // Serial.print(odometry.y, 3);
 
-      Serial.print(" | EncL=");
-      Serial.print(totalTicks_L);
+      // Serial.print(" | EncL=");
+      // Serial.print(totalTicks_L);
 
-      Serial.print(" | EncR=");
-      Serial.println(totalTicks_R);
+      // Serial.print(" | EncR=");
+      // Serial.println(totalTicks_R);
 
       // Serial.print(" | H=");
       // Serial.println(odometry.heading, 3);
