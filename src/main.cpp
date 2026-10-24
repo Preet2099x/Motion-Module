@@ -13,6 +13,7 @@
 #include "drive.h"
 #include "navigation.h"
 #include "follow.h"
+#include "camlock.h"
 
 int SLAVE_ADDRESS = 0x72;
 
@@ -69,6 +70,8 @@ bool straightBoost = false;
 
 bool frontCamLocked = false;
 bool backCamLocked = false;
+bool leftCamLocked = false;
+bool rightCamLocked = false;
 bool camBypass = false;
 
 volatile int lastEncoded_L = 0;
@@ -100,7 +103,6 @@ bool systemCounter = false;
 int data = 0;
 int rpmAlter_T = 0;
 int rpmAlter = 0;
-int _dirData = 0;
 
 // Time Variable
 float timeConstant = 100; // MilliSecond 100 | 10 ONLY -> Function-> handletime
@@ -233,6 +235,13 @@ void loop()
       {
         data = 0;
       }
+      // ── Camera lock codes: 101/102 front, 201/202 back, 301/302 left,
+      // 401/402 right. Consumed without touching `data` or the control timer,
+      // so a camera update never stops or restarts the current motion. ──
+      else if (CamLock_HandleLine(fullLine))
+      {
+        // consumed — flags updated
+      }
       // ── Task command: "T:..." ──
       else if (fullLine.startsWith("T:") || fullLine.startsWith("t:"))
       {
@@ -334,6 +343,8 @@ void loop()
       Drive_Cancel();
       Navigation_Cancel();
       Follow_Cancel();
+      CamLock_ClearAll();
+      Serial.println("CAM: all locks released (emergency)");
       emergencyAlter = false;
     }
   }
@@ -346,65 +357,41 @@ void loop()
     // directly).  Drive_IsRunning() covers queued commands (drive calls motion()).
     if (Drive_IsRunning() || Navigation_IsRunning() || Follow_IsRunning())
     {
-      static unsigned long navFrontLockTime = 0;
-      static unsigned long navBackLockTime = 0;
+      // Camera locks reach autonomous modes through the front flag only, as
+      // before: Navigation reads frontCamLocked for its sidestep, and a
+      // queued "T:..." task (Drive) is paused while the front camera is
+      // locked. Back/left/right locks are not applied to autonomous modes yet.
+      //
+      // Only pause/resume Drive's own queue when Drive actually owns the
+      // motors right now (a manual "T:..." task, or Navigation's
+      // FINAL_ALIGN handoff). Navigation's direct-drive phases react to
+      // frontCamLocked themselves — Drive_Update() forces motion(0) every
+      // tick while drivePaused is true, so pausing it while Navigation is
+      // driving directly would freeze the robot.
+      static bool camPausedDrive = false;
 
-      // ── Camera pause: 101/102 = pause task, 201/202 = resume task ──
-      // Also keep frontCamLocked/backCamLocked current so Navigation can
-      // react to an obstacle (e.g. sidestep during return-home).
-      if (!camBypass)
+      if (!camBypass && Drive_IsRunning() && frontCamLocked && !Drive_IsPaused() && !camPausedDrive)
       {
-        if (data == 101)
-        {
-          frontCamLocked = true;
-          navFrontLockTime = millis();
-        }
-        else if (data == 201 && frontCamLocked && (millis() - navFrontLockTime >= 500))
-        {
-          frontCamLocked = false;
-        }
-
-        if (data == 102)
-        {
-          backCamLocked = true;
-          navBackLockTime = millis();
-        }
-        else if (data == 202 && backCamLocked && (millis() - navBackLockTime >= 500))
-        {
-          backCamLocked = false;
-        }
-
-        // Only pause/resume Drive's own queue when Drive actually owns the
-        // motors right now (a manual "T:..." task, or Navigation's
-        // FINAL_ALIGN handoff). Navigation's direct-drive phases (pursuit/
-        // parking/creep/obstacle-avoid) react to frontCamLocked themselves —
-        // Drive_Update() forces motion(0) every tick while drivePaused is
-        // true regardless of whether Drive has a task, so pausing it here
-        // while Navigation is driving directly would freeze the robot until
-        // a 201 arrived, which never happens if the robot never moves.
-        if (Drive_IsRunning())
-        {
-          if (data == 101 && !Drive_IsPaused())
-          {
-            Drive_Pause(0);
-            Serial.println("PAUSE: camera 101");
-          }
-          else if (data == 201 && Drive_IsPaused())
-          {
-            Drive_Resume();
-            Serial.println("RESUME: camera 201");
-          }
-        }
+        Drive_Pause(0);
+        camPausedDrive = true;
+        Serial.println("PAUSE: front camera locked");
       }
+      else if (camPausedDrive && (!frontCamLocked || camBypass))
+      {
+        if (Drive_IsPaused())
+        {
+          Drive_Resume();
+          Serial.println("RESUME: front camera free");
+        }
+        camPausedDrive = false;
+      }
+
       // Manual data is ignored while an autonomous task is executing
       data = 0;
     }
     // ── Normal manual control ──
     else
     {
-      // --- Camera stop logic ---
-      static unsigned long frontLockTime = 0;
-      static unsigned long backLockTime = 0;
       static unsigned long camBypassTimer = 0;
 
       // 67 = toggle camera bypass
@@ -414,122 +401,21 @@ void loop()
         {
           camBypassTimer = millis();
           camBypass = !camBypass;
+          if (camBypass)
+            CamLock_ClearAll();
           Serial.println(camBypass ? "CAM BYPASS: ON (ignoring cameras)" : "CAM BYPASS: OFF (cameras active)");
         }
         data = 0;
       }
 
-      // Track last motion command (skip camera cmds so _dirData always holds the real motion)
-      if (data != 101 && data != 102 && data != 201 && data != 202 && data != 67)
-      {
-        _dirData = data;
-      }
-
-      if (!camBypass)
-      {
-        // Front camera: 101 lock, 201 release
-        if (data == 101)
-        {
-          frontCamLocked = true;
-          frontLockTime = millis();
-          Serial.println("FRONT CAM: LOCKED");
-
-          // Only pause the autonomous drive task — manual mode keeps its own selective logic
-          if (Drive_IsRunning())
-          {
-            Drive_Pause(_dirData);
-            Serial.println("PAUSE: Triggered by camera cmd 101 (drive task)");
-          }
-
-          // Only kill motors if current motion is a front-blocked command
-          // Front-blocked: 1 (forward), 111-120 (fwd-left curve), 121-130 (fwd-right curve)
-          if (_dirData == 1 || (_dirData >= 111 && _dirData <= 130))
-          {
-            analogWrite(pwmPin_L, 0);
-            analogWrite(pwmPin_R, 0);
-            digitalWrite(dirPin_L, LOW);
-            digitalWrite(dirPin_R, LOW);
-            data = 0;
-          }
-          else
-          {
-            // Not a front-moving command (e.g. turning) — keep current motion, just block future front cmds
-            data = _dirData;
-          }
-        }
-        else if (data == 201)
-        {
-          if (frontCamLocked && (millis() - frontLockTime >= 500))
-          {
-            frontCamLocked = false;
-            Serial.println("FRONT CAM: FREE");
-          }
-          // Resume drive mode if it was paused by 101
-          if (Drive_IsPaused())
-          {
-            Drive_Resume();
-            data = Drive_GetSavedData(); // restore saved manual command
-          }
-          else
-          {
-            data = _dirData;
-          }
-        }
-
-        // Back camera: 102 lock, 202 release
-        if (data == 102)
-        {
-          backCamLocked = true;
-          backLockTime = millis();
-          Serial.println("BACK CAM: LOCKED");
-          // Only kill motors if current motion is a back-blocked command
-          // Back-blocked: 2 (backward), 211-220 (bwd-left curve), 221-230 (bwd-right curve)
-          if (_dirData == 2 || (_dirData >= 211 && _dirData <= 230))
-          {
-            analogWrite(pwmPin_L, 0);
-            analogWrite(pwmPin_R, 0);
-            digitalWrite(dirPin_L, LOW);
-            digitalWrite(dirPin_R, LOW);
-            data = 0;
-          }
-          else
-          {
-            // Not a back-moving command (e.g. turning) — keep current motion, just block future back cmds
-            data = _dirData;
-          }
-        }
-        else if (data == 202)
-        {
-          if (backCamLocked && (millis() - backLockTime >= 500))
-          {
-            backCamLocked = false;
-            Serial.println("BACK CAM: FREE");
-          }
-          data = _dirData;
-        }
-
-        // Block commands when front camera locked: 1, 111-120, 121-130
-        if (frontCamLocked)
-        {
-          if (data == 1 || (data >= 111 && data <= 130))
-            data = 0;
-        }
-
-        // Block commands when back camera locked: 2, 211-220, 221-230
-        if (backCamLocked)
-        {
-          if (data == 2 || (data >= 211 && data <= 230))
-            data = 0;
-        }
-      }
-
-      // Update _dirData after blocking so it reflects what motion actually runs
-      if (data != 0)
-        _dirData = data;
-
-      // While paused: actively drive motors to 0 every loop to flush any ramp state
+      // While paused: actively drive motors to 0 every loop to flush any ramp state.
+      // A command blocked by a camera lock is stopped instantly (ramp state
+      // zeroed) but `data` is left alone, so motion resumes by itself when the
+      // lock is released as long as the sender is still holding the command.
       if (Drive_IsPaused())
         motion(0);
+      else if (CamLock_IsBlocked(data))
+        motion_EmergencyStop();
       else
         motion(data);
     }

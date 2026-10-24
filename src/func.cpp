@@ -4,6 +4,7 @@
 #include <i2c_driver.h>
 #include <i2c_driver_wire.h>
 #include "follow.h"
+#include "camlock.h"
 
 float calcAlphaEMA(float fn)
 {
@@ -72,6 +73,13 @@ void receiveEvent(int bytesReceived)
     if (cmd.length() == 1 && cmd.charAt(0) == 'c')
     {
         Follow_Start();
+        return;
+    }
+
+    // Camera lock codes (101/102 ... 401/402) only update the lock flags;
+    // they must not overwrite the current motion command in `data`.
+    if (CamLock_HandleLine(cmd))
+    {
         return;
     }
 

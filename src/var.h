@@ -77,6 +77,8 @@ extern bool straightBoost;
 // Camera stop
 extern bool frontCamLocked;
 extern bool backCamLocked;
+extern bool leftCamLocked;
+extern bool rightCamLocked;
 extern bool camBypass;
 
 // Pid Variable
