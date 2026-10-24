@@ -137,10 +137,10 @@ static const SideInfo SIDES[4] = {
 // right). Leave "" for a position with no camera. Command-line serials
 // override this table.
 static const char* const CAM_SERIALS[4] = {
-    "261622303624", // front
-    "261522307129", // back
+    "261622300841", // front
+    "261622303624", // back
     "261622301455", // left
-    "261622300841", // right
+    "261522307129", // right
 };
 
 // ── Teensy serial link ──
