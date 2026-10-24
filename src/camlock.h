@@ -7,8 +7,8 @@
 //
 //     front  101 lock / 102 release   blocks 1, 111-130
 //     back   201 lock / 202 release   blocks 2, 211-230
-//     left   301 lock / 302 release   blocks 11-20, 111-120, 211-220
-//     right  401 lock / 402 release   blocks 21-30, 121-130, 221-230
+//     left   301 lock / 302 release   blocks 21-30, 121-130, 221-230
+//     right  401 lock / 402 release   blocks 11-20, 111-120, 211-220
 //
 // A command is blocked if ANY locked side covers it. Emergency releases all.
 // Lock codes are consumed here and never stored in `data`, so a camera

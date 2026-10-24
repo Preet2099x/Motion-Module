@@ -75,11 +75,11 @@ bool CamLock_IsBlocked(int cmd)
         return true;
 
     if (leftCamLocked &&
-        ((cmd >= 11 && cmd <= 20) || (cmd >= 111 && cmd <= 120) || (cmd >= 211 && cmd <= 220)))
+        ((cmd >= 21 && cmd <= 30) || (cmd >= 121 && cmd <= 130) || (cmd >= 221 && cmd <= 230)))
         return true;
 
     if (rightCamLocked &&
-        ((cmd >= 21 && cmd <= 30) || (cmd >= 121 && cmd <= 130) || (cmd >= 221 && cmd <= 230)))
+        ((cmd >= 11 && cmd <= 20) || (cmd >= 111 && cmd <= 120) || (cmd >= 211 && cmd <= 220)))
         return true;
 
     return false;
