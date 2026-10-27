@@ -3,6 +3,50 @@
 #include <Arduino.h>
 #include <var.h>
 
+// ── CAMD distance line ──
+static const unsigned long CAMD_FRESH_MS = 600;
+
+static float camD1[4];
+static unsigned long camStamp[4];
+static bool camValid[4];
+
+static void parseCamd(const String &line)
+{
+    const char keys[4] = {'F', 'B', 'L', 'R'};
+    const unsigned long now = millis();
+
+    for (int i = 0; i < 4; i++)
+    {
+        String tag = String(" ") + keys[i] + "=";
+        int at = line.indexOf(tag);
+        if (at < 0)
+            continue;
+
+        int from = at + 3;
+        int to = line.indexOf(' ', from);
+        if (to < 0)
+            to = line.length();
+
+        String field = line.substring(from, to);
+        if (field.length() == 0 || field.charAt(0) == '-')
+        {
+            camValid[i] = false;
+            continue;
+        }
+
+        camD1[i] = field.toFloat(); // reads up to the '/'
+        camStamp[i] = now;
+        camValid[i] = true;
+    }
+}
+
+float CamDist_Free(CamSide side)
+{
+    if (!camValid[side] || millis() - camStamp[side] > CAMD_FRESH_MS)
+        return -1.0f;
+    return camD1[side];
+}
+
 bool CamLock_HandleCode(int code)
 {
     bool *flag = nullptr;
@@ -39,6 +83,12 @@ bool CamLock_HandleCode(int code)
 
 bool CamLock_HandleLine(const String &line)
 {
+    if (line.startsWith("CAMD"))
+    {
+        parseCamd(line);
+        return true;
+    }
+
     if (line.length() != 3)
         return false;
 

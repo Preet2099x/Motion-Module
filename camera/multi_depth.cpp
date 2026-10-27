@@ -17,7 +17,10 @@
 // again for every side after the Teensy link reconnects):
 //   front 101 lock / 102 release     back  201 lock / 202 release
 //   left  301 lock / 302 release     right 401 lock / 402 release
-// A camera that is not live sends nothing. If this program exits while a
+// Every tick (10x/s) it also sends the distances, which Navigation uses to
+// pick the freer side when going round an object:
+//   CAMD F=d1/d2 B=d1/d2 L=d1/d2 R=d1/d2        ("--" for a camera that is not live)
+// A camera that is not live sends no lock code. If this program exits while a
 // side is locked, that lock stays on the Teensy until an emergency stop.
 //
 // Teensy link: /dev/ttyACM1, else /dev/ttyACM2 (whichever answers "m" with
@@ -133,6 +136,9 @@ static const SideInfo SIDES[4] = {
     {"right", 401, 402},
 };
 
+// One-letter keys used in the CAMD line, in SIDES order.
+static const char SIDE_KEYS[4] = {'F', 'B', 'L', 'R'};
+
 // Camera serial number for each position, in SIDES order (front, back, left,
 // right). Leave "" for a position with no camera. Command-line serials
 // override this table.
@@ -233,22 +239,23 @@ public:
         return false;
     }
 
-    // True if the whole line was written. False means "not sent": the caller
-    // keeps the state unsent and tries again.
-    bool send_code(int code)
+    // True if the whole line (plus newline) was written. False means "not
+    // sent": the caller keeps the state unsent and tries again.
+    bool send_line(const std::string& text)
     {
         if (fd_ < 0) return false;
 
-        char buf[16];
-        int n = std::snprintf(buf, sizeof(buf), "%d\n", code);
-        ssize_t w = ::write(fd_, buf, static_cast<size_t>(n));
-        if (w == n) return true;
+        std::string line = text + "\n";
+        ssize_t w = ::write(fd_, line.data(), line.size());
+        if (w == static_cast<ssize_t>(line.size())) return true;
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return false;
 
         std::cerr << "\n[teensy] write failed on " << port_ << ", reconnecting" << std::endl;
         close_port();
         return false;
     }
+
+    bool send_code(int code) { return send_line(std::to_string(code)); }
 
 private:
     void close_port()
@@ -316,8 +323,10 @@ static void cam_worker(rs2::context& ctx, Cam& cam, int index)
                 const int depth_w = depth.get_width();
                 const int depth_h = depth.get_height();
 
-                const int c1 = depth_w / 6;
-                const int c2 = 5 * depth_w / 6;
+                // Full image width. Pixels with no depth (the stereo blind
+                // strip at the edge) read 0 and are skipped below.
+                const int c1 = 0;
+                const int c2 = depth_w;
 
                 const int r1a = 0;
                 const int r2a = static_cast<int>(depth_h * 0.8f);
@@ -464,6 +473,11 @@ int main(int argc, char** argv)
             std::string line = "\r";
             char buf[96];
 
+            // Latest distances per side for the CAMD line (live cameras only)
+            bool d_live[4] = {false, false, false, false};
+            float d_1[4] = {0.f, 0.f, 0.f, 0.f};
+            float d_2[4] = {0.f, 0.f, 0.f, 0.f};
+
             for (size_t i = 0; i < cams.size(); ++i)
             {
                 Cam& cam = *cams[i];
@@ -480,6 +494,10 @@ int main(int argc, char** argv)
 
                 const float d1 = cam.dist1_cm;
                 const float d2 = cam.dist2_cm;
+
+                d_live[cam.side] = true;
+                d_1[cam.side] = d1;
+                d_2[cam.side] = d2;
 
                 bool want;
                 if (st.known && st.locked)
@@ -502,6 +520,23 @@ int main(int argc, char** argv)
                 std::snprintf(buf, sizeof(buf), "%s %6.1f/%6.1f %s | ",
                               side.name, d1, d2, st.locked ? "LOCK" : "    ");
                 line += buf;
+            }
+
+            // Distances for Navigation's free-side choice. Best effort: a
+            // dropped line is replaced by the next one 100 ms later.
+            if (link.connected())
+            {
+                std::string camd = "CAMD";
+                for (int s = 0; s < 4; ++s)
+                {
+                    char b[40];
+                    if (d_live[s])
+                        std::snprintf(b, sizeof(b), " %c=%.1f/%.1f", SIDE_KEYS[s], d_1[s], d_2[s]);
+                    else
+                        std::snprintf(b, sizeof(b), " %c=--", SIDE_KEYS[s]);
+                    camd += b;
+                }
+                link.send_line(camd);
             }
 
             line += link.connected() ? link.port() : std::string("no teensy link");

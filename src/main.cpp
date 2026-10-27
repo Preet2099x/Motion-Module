@@ -218,10 +218,14 @@ void loop()
 
       // Echo everything that arrives on USB serial, so incoming data is
       // visible even when no command below recognises it.
-      Serial.print("RX[");
-      Serial.print(fullLine.length());
-      Serial.print("]: ");
-      Serial.println(fullLine);
+      // (CAMD distance lines arrive ~10x/s; echoing them would drown the log.)
+      if (!fullLine.startsWith("CAMD"))
+      {
+        Serial.print("RX[");
+        Serial.print(fullLine.length());
+        Serial.print("]: ");
+        Serial.println(fullLine);
+      }
 
       // ── Beacon ranges: "A=2.69M B=2.36M" ──
       // Must be checked before the numeric fallthrough at the bottom, where
