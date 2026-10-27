@@ -461,12 +461,17 @@ static void configureRpdo1(Drive &d) {
                 d.rpdoType == 1 ? "synchronous" : "asynchronous");
 }
 
-// Switches the profile deceleration between the normal and the hard-stop value.
+// Switches the profile ramps between the normal and the hard-stop value. The hard stop sets acceleration
+// too: depending on the drive, slowing down while reversing can count as "acceleration".
 static bool hardDecel = false;
 static void setProfileDecel(bool hard) {
-  uint32_t rpmPerS = hard ? HARD_STOP_DECEL_RPM_PER_S : DECEL_RPM_PER_S;
-  for (Drive &d : drives)
-    if (d.online) sdoWrite(d, OD_PROFILE_DECEL, 0, (uint32_t)((uint64_t)rpmPerS * d.countsPerRev / 60), 4);
+  uint32_t accel = hard ? HARD_STOP_DECEL_RPM_PER_S : ACCEL_RPM_PER_S;
+  uint32_t decel = hard ? HARD_STOP_DECEL_RPM_PER_S : DECEL_RPM_PER_S;
+  for (Drive &d : drives) {
+    if (!d.online) continue;
+    sdoWrite(d, OD_PROFILE_ACCEL, 0, (uint32_t)((uint64_t)accel * d.countsPerRev / 60), 4);
+    sdoWrite(d, OD_PROFILE_DECEL, 0, (uint32_t)((uint64_t)decel * d.countsPerRev / 60), 4);
+  }
   hardDecel = hard;
 }
 
