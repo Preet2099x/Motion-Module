@@ -59,6 +59,17 @@ static const float AVOID_PASS_MAX_DIST   = 2.00f; // m - stop waiting for the si
 static const float AVOID_SIDE_KEEP_CM    = 60.0f; // while passing, steer away from anything closer than this on a side
 static const float AVOID_SIDE_CLEAR_CM   = 100.0f; // the object-side camera counts as clear above this
 
+// Side choice: each side gets a score in "cm of free room" and the higher one wins.
+//   score = free room on that side (capped)
+//         + a bias toward the side home lies on (less angle to rejoin the route)
+//         - a cost per degree already turned AWAY from that side (undoing a turn
+//           is wasted angle)
+static const float AVOID_FREE_CAP_CM     = 200.0f; // room beyond this adds nothing
+static const float AVOID_FREE_DEFAULT_CM = 100.0f; // assumed when a side has no fresh reading and is not locked
+static const float AVOID_HOME_BIAS_CM    = 40.0f;  // score bonus for the side home lies on (full at 90 deg off)
+static const float AVOID_TURN_COST_CM_PER_DEG = 1.0f;
+static const float AVOID_SWITCH_MARGIN_CM = 25.0f; // the other side must beat the current one by this much to switch
+
 // ─── Obstacle-avoidance state ──────────────────────────
 // Reactive, re-evaluated every tick. It drives motion() directly (like
 // PURSUIT/PARKING/CREEP), so Drive's pause flag can never freeze it.
@@ -91,7 +102,8 @@ static int avoidLastDir = 0;  // side used last time (0 = none yet)
 static unsigned long avoidLastMs = 0;
 static unsigned long avoidClearSince = 0; // 0 = not currently clear
 static unsigned long avoidSettleStart = 0;
-static float avoidTurned = 0.0f;       // degrees rotated in the current TURN
+static float avoidTurned = 0.0f;       // degrees rotated in the current TURN (absolute)
+static float avoidRot = 0.0f;          // signed degrees since the encounter began: + = turned right
 static float avoidLastHeading = 0.0f;
 static float avoidPassStartDist = 0.0f;
 static float avoidBackStartDist = 0.0f;
@@ -129,30 +141,53 @@ static bool sideLocked(int dir)
     return dir > 0 ? rightCamLocked : leftCamLocked;
 }
 
-// +1 = right, -1 = left: whichever side has more free space.
-static int chooseAvoidSide()
+// Score for going round on `dir` (+1 right, -1 left): free room on that side,
+// plus a small bias toward the side home lies on, minus the angle we would
+// have to undo to use it. Higher is better.
+static float sideScore(int dir)
 {
-    // Keep going round the same side as a moment ago, so the robot hugs one
-    // object instead of flip-flopping, unless that side is blocked now.
-    if (avoidLastDir != 0 && millis() - avoidLastMs < AVOID_STICKY_MS && !sideLocked(avoidLastDir))
-        return avoidLastDir;
+    float free = CamDist_Free(dir > 0 ? CAM_RIGHT : CAM_LEFT);
 
-    float left = CamDist_Free(CAM_LEFT);
-    float right = CamDist_Free(CAM_RIGHT);
+    if (free < 0.0f) // no fresh reading: judge by the lock flag alone
+        free = sideLocked(dir) ? 0.0f : AVOID_FREE_DEFAULT_CM;
+    if (free > AVOID_FREE_CAP_CM)
+        free = AVOID_FREE_CAP_CM;
 
-    if (left >= 0.0f && right >= 0.0f)
-        return (right >= left) ? 1 : -1;
+    // heading error to home: + means home lies to the right of where we face
+    float homeError = normalizeAngle(calculateHeadingToHome() - odometry.heading);
+    float homeAlign = constrain(homeError * dir / 90.0f, -1.0f, 1.0f);
 
-    // No fresh distances: use the lock flags, else the side home lies on.
-    if (leftCamLocked != rightCamLocked)
-        return leftCamLocked ? 1 : -1;
+    // already turned toward the other side by avoidRot degrees: using this
+    // side means turning back through that angle first
+    float undo = -dir * avoidRot;
+    if (undo < 0.0f)
+        undo = 0.0f;
 
-    float headingError = normalizeAngle(calculateHeadingToHome() - odometry.heading);
-    return (headingError >= 0.0f) ? 1 : -1;
+    return free + AVOID_HOME_BIAS_CM * homeAlign - AVOID_TURN_COST_CM_PER_DEG * undo;
 }
 
-static void startTurn(int dir)
+// +1 = right, -1 = left: the side with the better score. Within a few seconds
+// of the last avoidance the side used then is kept unless the other is clearly
+// better (so the robot hugs one object instead of flip-flopping).
+static int chooseAvoidSide()
 {
+    float right = sideScore(1);
+    float left = sideScore(-1);
+
+    if (avoidLastDir != 0 && millis() - avoidLastMs < AVOID_STICKY_MS && !sideLocked(avoidLastDir))
+    {
+        float cur = (avoidLastDir > 0) ? right : left;
+        float oth = (avoidLastDir > 0) ? left : right;
+        return (oth > cur + AVOID_SWITCH_MARGIN_CM) ? -avoidLastDir : avoidLastDir;
+    }
+
+    return (right >= left) ? 1 : -1;
+}
+
+static void startTurn(int dir, bool newEncounter)
+{
+    if (newEncounter)
+        avoidRot = 0.0f; // flips within one encounter keep counting from the same start
     avoidDir = dir;
     avoidLastDir = dir;
     avoidLastMs = millis();
@@ -177,6 +212,14 @@ static void startTurn(int dir)
     else
         Serial.print("?");
     Serial.println(" cm)");
+}
+
+// A new encounter (or a re-route after passing): forget the angle turned so
+// far, so the side choice is not skewed by the previous one, then pick a side.
+static void startFreshTurn()
+{
+    avoidRot = 0.0f;
+    startTurn(chooseAvoidSide(), true);
 }
 
 // First entry into obstacle avoidance from a driving phase (PURSUIT/PARKING/
@@ -204,7 +247,7 @@ static void beginObstacleManeuver(NavigationState returnState)
         return;
     }
 
-    startTurn(chooseAvoidSide());
+    startFreshTurn();
 }
 
 // The object we are going round sits on the side opposite the way we turned.
@@ -234,7 +277,7 @@ static void updateObstacleAvoid()
         if (backCamLocked || backed >= AVOID_BACKUP_DIST || now - avoidBackStartMs >= AVOID_BACKUP_MAX_MS)
         {
             motion_EmergencyStop();
-            startTurn(chooseAvoidSide());
+            startFreshTurn();
             break;
         }
 
@@ -244,7 +287,9 @@ static void updateObstacleAvoid()
 
     case AVOID_TURN:
     {
-        avoidTurned += fabs(normalizeAngle(odometry.heading - avoidLastHeading));
+        float step = normalizeAngle(odometry.heading - avoidLastHeading);
+        avoidTurned += fabs(step);
+        avoidRot += step; // signed: + = turned right
         avoidLastHeading = odometry.heading;
 
         // Never rotate into something beside us: if the side we are turning
@@ -255,13 +300,24 @@ static void updateObstacleAvoid()
             if (!sideLocked(-avoidDir))
             {
                 Serial.println("NAVIGATION: Object beside the turn - switching side");
-                startTurn(-avoidDir);
+                startTurn(-avoidDir, false);
             }
             else if (now - avoidWaitMs >= 2000)
             {
                 avoidWaitMs = now;
                 Serial.println("NAVIGATION: Boxed in on both sides - waiting");
             }
+            break;
+        }
+
+        // Keep working out which way makes sense: if more turning this way
+        // would run into another object (or needs far more angle) and the other
+        // side is clearly better even after undoing the turn made so far, switch.
+        if (sideScore(-avoidDir) > sideScore(avoidDir) + AVOID_SWITCH_MARGIN_CM)
+        {
+            motion_EmergencyStop();
+            Serial.println("NAVIGATION: Other side is the shorter way round - switching");
+            startTurn(-avoidDir, false);
             break;
         }
 
@@ -292,7 +348,7 @@ static void updateObstacleAvoid()
         if (avoidTurned >= AVOID_SWITCH_AFTER_DEG)
         {
             Serial.println("NAVIGATION: Still blocked after a wide turn - trying the other side");
-            startTurn(-avoidDir);
+            startTurn(-avoidDir, false);
             break;
         }
 
@@ -318,7 +374,7 @@ static void updateObstacleAvoid()
         {
             motion_EmergencyStop();
             Serial.println("NAVIGATION: Blocked again while passing - re-routing");
-            startTurn(chooseAvoidSide());
+            startFreshTurn();
             break;
         }
 
