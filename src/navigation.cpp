@@ -38,12 +38,16 @@ static const float ARC_MEDIUM_ZONE  = 35.0f;  // medium arc (115/125)
 static const float ARC_TIGHT_ZONE   = 90.0f;  // tight arc  (117/127)
                                                 // beyond this: in-place turn
 
-// Parking heading-error thresholds (degrees)
-static const float PARK_STRAIGHT_ZONE = 5.0f;
-static const float PARK_ARC_ZONE      = 20.0f;
-
-// Creep heading-error threshold — must align precisely before inching forward
-static const float CREEP_ALIGN_ZONE   = 1.0f;  // degrees (strict alignment)
+// Parking / creep: one smooth sequence instead of a code per angle band.
+//   SPIN -> ARC -> STRAIGHT, each with a wide gap between entering and leaving
+//   it, so the heading error wobbling a degree or two never flips the motion.
+static const float PARK_SPIN_ENTER_DEG    = 35.0f; // error above this: spin in place
+static const float PARK_SPIN_FAST_DEG     = 30.0f; // ...faster while the error is this big
+static const float PARK_SPIN_EXIT_DEG     = 8.0f;  // spin until the error is below this, then arc
+static const float PARK_ARC_EXIT_DEG      = 3.0f;  // arc until the error is below this, then straight
+static const float PARK_STRAIGHT_LEAVE_DEG = 12.0f; // straight until the error grows past this
+static const float PARK_FREEZE_DIST       = 0.04f; // m — this close the angle to home is unreliable: just keep straight
+static const float CREEP_PASS_MARGIN      = 0.005f; // m — drifted this far past the closest approach = arrived
 
 // Obstacle-avoidance tuning
 static const unsigned long AVOID_TURN_CLEAR_HOLD_MS = 100; // front must read clear this long before the turn ends
@@ -376,6 +380,68 @@ static void navMotion(int cmd, float headingError)
     motion(cmd);
 }
 
+// ─── Parking motion ────────────────────────────────────
+enum ParkMode
+{
+    PM_NEW,      // pick from the current error
+    PM_STRAIGHT,
+    PM_ARC,
+    PM_SPIN
+};
+
+static ParkMode parkMode = PM_NEW;
+static float creepMinDist = 1000.0f; // closest approach to home so far in CREEP
+
+// The motion code for the slow approach (PARKING and CREEP share it).
+static int parkCmd(float headingError, float dist)
+{
+    const float a = fabs(headingError);
+    const bool right = (headingError > 0.0f);
+
+    // Right on top of home the bearing swings wildly with a millimetre of
+    // sideways error; chasing it is what makes the last bit twitch.
+    if (dist < PARK_FREEZE_DIST)
+    {
+        parkMode = PM_STRAIGHT;
+        return 3;
+    }
+
+    if (parkMode == PM_NEW)
+        parkMode = (a < PARK_ARC_EXIT_DEG) ? PM_STRAIGHT : (a < PARK_SPIN_ENTER_DEG) ? PM_ARC : PM_SPIN;
+
+    switch (parkMode)
+    {
+    case PM_STRAIGHT:
+        if (a > PARK_STRAIGHT_LEAVE_DEG)
+            parkMode = (a > PARK_SPIN_ENTER_DEG) ? PM_SPIN : PM_ARC;
+        break;
+    case PM_ARC:
+        if (a < PARK_ARC_EXIT_DEG)
+            parkMode = PM_STRAIGHT;
+        else if (a > PARK_SPIN_ENTER_DEG)
+            parkMode = PM_SPIN;
+        break;
+    case PM_SPIN:
+        if (a < PARK_SPIN_EXIT_DEG)
+            parkMode = PM_ARC;
+        break;
+    default:
+        break;
+    }
+
+    switch (parkMode)
+    {
+    case PM_SPIN:
+        if (a > PARK_SPIN_FAST_DEG)
+            return right ? 15 : 25; // PWM 120
+        return right ? 13 : 23;     // PWM 80
+    case PM_ARC:
+        return right ? 111 : 121;   // gentle arc
+    default:
+        return 3;                   // PWM 85 straight
+    }
+}
+
 // ─── Public API ────────────────────────────────────────
 
 void Navigation_Init()
@@ -430,6 +496,7 @@ void Navigation_ReturnHome()
     {
         Serial.println("NAVIGATION: Returning home (parking — already close)");
         state = NAV_PARKING;
+        parkMode = PM_NEW;
     }
     else
     {
@@ -470,6 +537,7 @@ void Navigation_Update()
             Serial.print(dist, 2);
             Serial.println(" m)");
             state = NAV_PARKING;
+            parkMode = PM_NEW;
             return; // will handle parking on next tick
         }
 
@@ -522,36 +590,15 @@ void Navigation_Update()
             Serial.print(dist, 3);
             Serial.println(" m)");
             state = NAV_CREEP;
+            creepMinDist = dist;
             return;
         }
 
         // Heading error
         float targetHeading = calculateHeadingToHome();
         float headingError  = normalizeAngle(targetHeading - odometry.heading);
-        float absError      = fabs(headingError);
 
-        // Parking uses ONLY gentle codes (≤x3 sub-range → lowest PWM)
-        if (absError < PARK_STRAIGHT_ZONE)
-        {
-            // Nearly on target — use crawl straight forward
-            navMotion(3, headingError); // PWM 85 straight
-        }
-        else if (absError < PARK_ARC_ZONE)
-        {
-            // Moderate correction — gentle arc
-            navMotion(headingError > 0 ? 111 : 121, headingError);
-        }
-        else
-        {
-            // Large heading error while parking — in-place turn with enough power to not stall
-            if (absError > 15.0f) {
-                navMotion(headingError > 0 ? 15 : 25, headingError); // PWM 120
-            } else if (absError > 5.0f) {
-                navMotion(headingError > 0 ? 13 : 23, headingError); // PWM 80
-            } else {
-                navMotion(headingError > 0 ? 11 : 21, headingError); // PWM 60
-            }
-        }
+        navMotion(parkCmd(headingError, dist), headingError);
 
         return;
     }
@@ -563,8 +610,13 @@ void Navigation_Update()
         float dy = -odometry.y;
         float dist = sqrtf(dx * dx + dy * dy);
 
-        // Reached home — stop and do final heading alignment
-        if (dist < HOME_TOLERANCE)
+        // Reached home (or crept to the closest point and started to drift past
+        // it) — stop and do final heading alignment
+        if (dist < creepMinDist)
+            creepMinDist = dist;
+        bool passedHome = (dist < PARK_FREEZE_DIST) && (dist > creepMinDist + CREEP_PASS_MARGIN);
+
+        if (dist < HOME_TOLERANCE || passedHome)
         {
             motion(0); // stop motors
 
@@ -588,28 +640,8 @@ void Navigation_Update()
         // Heading error
         float targetHeading = calculateHeadingToHome();
         float headingError  = normalizeAngle(targetHeading - odometry.heading);
-        float absError      = fabs(headingError);
 
-        // CREEP STRATEGY:
-        // 1. If heading is off, STOP and crawl-turn to align first
-        // 2. Only inch forward once heading is within CREEP_ALIGN_ZONE
-        // This prevents overshoot from driving at an angle
-        if (absError >= CREEP_ALIGN_ZONE)
-        {
-            // Stop forward motion, align heading with scaled in-place turn to prevent stall
-            if (absError > 15.0f) {
-                navMotion(headingError > 0 ? 15 : 25, headingError); // PWM 120
-            } else if (absError > 5.0f) {
-                navMotion(headingError > 0 ? 13 : 23, headingError); // PWM 80
-            } else {
-                navMotion(headingError > 0 ? 11 : 21, headingError); // PWM 60
-            }
-        }
-        else
-        {
-            // Heading aligned — inch forward perfectly straight
-            navMotion(3, headingError); // PWM 85 straight
-        }
+        navMotion(parkCmd(headingError, dist), headingError);
 
         return;
     }
