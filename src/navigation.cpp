@@ -20,7 +20,7 @@ enum NavigationState
     NAV_PARKING,        // Close to home — slow approach
     NAV_CREEP,          // Very close — precision align-then-inch
     NAV_FINAL_ALIGN,    // At home — turning to heading 0°
-    NAV_OBSTACLE_AVOID  // Front camera locked — go round the object on the freer side
+    NAV_OBSTACLE_AVOID  // Front camera locked — turn toward the side with more room until it clears
 };
 
 static NavigationState state = NAV_IDLE;
@@ -45,71 +45,54 @@ static const float PARK_ARC_ZONE      = 20.0f;
 // Creep heading-error threshold — must align precisely before inching forward
 static const float CREEP_ALIGN_ZONE   = 1.0f;  // degrees (strict alignment)
 
-// Obstacle-avoidance ("go around it") tuning
-static const unsigned long AVOID_CLEAR_HOLD_MS = 300;  // front/side must read clear this long before moving on
-static const unsigned long AVOID_SETTLE_MS     = 250;  // stand still between the turn and the pass
-static const unsigned long AVOID_STICKY_MS     = 6000; // keep going round the same side / same object for this long
-static const float AVOID_BACKUP_DIST     = 0.20f; // m reversed before turning, to give the turn room
-static const float AVOID_BACKUP_MIN_CM   = 50.0f; // rear camera must show at least this free to reverse
-static const unsigned long AVOID_BACKUP_MAX_MS = 2500;
-static const float AVOID_EXTRA_TURN_DEG  = 30.0f; // keep turning this far after the front reads clear
+// Obstacle-avoidance tuning
+static const unsigned long AVOID_TURN_CLEAR_HOLD_MS = 100; // front must read clear this long before the turn ends
+static const unsigned long AVOID_SETTLE_MS = 120;   // short ramp-down between the turn and driving on
+static const unsigned long AVOID_STICKY_MS = 6000;  // keep turning the same way for this long after an object
 static const float AVOID_SWITCH_AFTER_DEG = 220.0f; // turned this far with the front still locked: try the other side
-static const float AVOID_PASS_MIN_DIST   = 0.50f; // m driven past the object before rejoining the route home
-static const float AVOID_PASS_MAX_DIST   = 2.00f; // m - stop waiting for the side camera to clear
-static const float AVOID_SIDE_KEEP_CM    = 60.0f; // while passing, steer away from anything closer than this on a side
-static const float AVOID_SIDE_CLEAR_CM   = 100.0f; // the object-side camera counts as clear above this
-
-// Side choice: each side gets a score in "cm of free room" and the higher one wins.
-//   score = free room on that side (capped)
-//         + a bias toward the side home lies on (less angle to rejoin the route)
-//         - a cost per degree already turned AWAY from that side (undoing a turn
-//           is wasted angle)
-static const float AVOID_FREE_CAP_CM     = 200.0f; // room beyond this adds nothing
-static const float AVOID_FREE_DEFAULT_CM = 100.0f; // assumed when a side has no fresh reading and is not locked
-static const float AVOID_HOME_BIAS_CM    = 40.0f;  // score bonus for the side home lies on (full at 90 deg off)
-static const float AVOID_TURN_COST_CM_PER_DEG = 1.0f;
-static const float AVOID_SWITCH_MARGIN_CM = 25.0f; // the other side must beat the current one by this much to switch
+static const float AVOID_SIDE_NEAR_CM  = 55.0f;     // a side closer than this is "in the way": don't curve toward it
+static const float AVOID_SIDE_HYST_CM  = 15.0f;     // ...until it reads this much further than NEAR
+static const unsigned long AVOID_SIDE_CLEAR_HOLD_MS = 100; // ...for this long
+static const float AVOID_FRONT_SLOW_CM = 80.0f;     // something this close ahead: crawl instead of full speed
+static const float AVOID_ROOM_CAP_CM   = 200.0f;    // room beyond this adds nothing
+static const float AVOID_ROOM_DEFAULT_CM = 100.0f;  // assumed when a side has no fresh reading and is not locked
+static const float AVOID_TIE_CM        = 20.0f;     // sides this close in room: turn toward the side home is on
 
 // ─── Obstacle-avoidance state ──────────────────────────
-// Reactive, re-evaluated every tick. It drives motion() directly (like
-// PURSUIT/PARKING/CREEP), so Drive's pause flag can never freeze it.
-//   BACKUP  first contact with an object: reverse a little (if the rear camera
-//           shows room) so the turn has space.
-//   TURN    pick the side with more free space and rotate in place toward it
-//           until the front reads clear, plus a margin. Never rotates into a
-//           side camera that is locked.
-//   SETTLE  brief stop between the turn and the pass.
-//   PASS    drive forward past the object, curving away from anything close on
-//           either side. Done when the camera on the object's side reads clear
-//           and a minimum distance has been driven; the interrupted phase
-//           (PURSUIT/PARKING/CREEP) then resumes and steers back toward home.
-// If the front locks again at any point (the same object or a new one) it
-// goes back to TURN and picks a side again, so it keeps routing round
-// whatever is in the way. There is no give-up: it never just sits still
-// unless both sides are blocked.
+// No separate "go round it" route: every tick the driving phases (PURSUIT/
+// PARKING/CREEP) pick the motion that heads straight for home, and navMotion()
+// only vetoes what the cameras say is unsafe.
+//
+//   Front locked   -> NAV_OBSTACLE_AVOID: look at the left and right cameras,
+//                     spin in place toward the one with more room, stop as soon
+//                     as the front reads clear, then carry on.
+//   Home now lies on the side we turned away from. Its camera is watched: while
+//                     something is close there the robot drives straight on
+//                     (it never curves toward it), and the moment it opens up
+//                     the robot curves back toward home, gently.
+//   Side locked    -> an in-place turn toward it is flipped the other way (held
+//                     still if both sides are locked).
 enum ObstaclePhase
 {
-    AVOID_BACKUP,
     AVOID_TURN,
-    AVOID_SETTLE,
-    AVOID_PASS
+    AVOID_SETTLE
 };
 
 static NavigationState avoidReturnState = NAV_PURSUIT; // phase to resume once clear
 static ObstaclePhase avoidPhase = AVOID_TURN;
 static int avoidDir = 1;      // +1 turn right, -1 turn left
-static int avoidLastDir = 0;  // side used last time (0 = none yet)
+static int avoidLastDir = 0;  // way turned last time (0 = none yet)
 static unsigned long avoidLastMs = 0;
-static unsigned long avoidClearSince = 0; // 0 = not currently clear
+static unsigned long avoidClearSince = 0; // 0 = front not currently clear
 static unsigned long avoidSettleStart = 0;
-static float avoidTurned = 0.0f;       // degrees rotated in the current TURN (absolute)
-static float avoidRot = 0.0f;          // signed degrees since the encounter began: + = turned right
+static float avoidTurned = 0.0f;          // degrees rotated in the current turn
 static float avoidLastHeading = 0.0f;
-static float avoidPassStartDist = 0.0f;
-static float avoidBackStartDist = 0.0f;
-static unsigned long avoidBackStartMs = 0;
-static float avoidClearMark = 0.0f;        // avoidTurned when the front first read clear
-static unsigned long avoidWaitMs = 0;      // last "boxed in" message
+static unsigned long avoidWaitMs = 0;     // last "boxed in" message
+static bool avoidRecovering = false;      // just got round something: curve back toward home gently
+
+// "Something close beside us" per side, latched. [0]=left [1]=right
+static bool sideNearFlag[2] = {false, false};
+static unsigned long sideClearSince[2] = {0, 0};
 
 // ─── Helpers ───────────────────────────────────────────
 
@@ -141,53 +124,72 @@ static bool sideLocked(int dir)
     return dir > 0 ? rightCamLocked : leftCamLocked;
 }
 
-// Score for going round on `dir` (+1 right, -1 left): free room on that side,
-// plus a small bias toward the side home lies on, minus the angle we would
-// have to undo to use it. Higher is better.
-static float sideScore(int dir)
+// Refresh the per-side "something close" flags from the side cameras.
+static void updateSideNear()
 {
-    float free = CamDist_Free(dir > 0 ? CAM_RIGHT : CAM_LEFT);
+    const unsigned long now = millis();
 
-    if (free < 0.0f) // no fresh reading: judge by the lock flag alone
-        free = sideLocked(dir) ? 0.0f : AVOID_FREE_DEFAULT_CM;
-    if (free > AVOID_FREE_CAP_CM)
-        free = AVOID_FREE_CAP_CM;
+    for (int i = 0; i < 2; i++)
+    {
+        int dir = (i == 1) ? 1 : -1;
+        float d = CamDist_Free(dir > 0 ? CAM_RIGHT : CAM_LEFT);
+        bool close = sideLocked(dir);
 
-    // heading error to home: + means home lies to the right of where we face
-    float homeError = normalizeAngle(calculateHeadingToHome() - odometry.heading);
-    float homeAlign = constrain(homeError * dir / 90.0f, -1.0f, 1.0f);
+        if (d >= 0.0f)
+            close = close || d < AVOID_SIDE_NEAR_CM + (sideNearFlag[i] ? AVOID_SIDE_HYST_CM : 0.0f);
 
-    // already turned toward the other side by avoidRot degrees: using this
-    // side means turning back through that angle first
-    float undo = -dir * avoidRot;
-    if (undo < 0.0f)
-        undo = 0.0f;
-
-    return free + AVOID_HOME_BIAS_CM * homeAlign - AVOID_TURN_COST_CM_PER_DEG * undo;
+        if (close)
+        {
+            sideNearFlag[i] = true;
+            sideClearSince[i] = 0;
+        }
+        else if (sideNearFlag[i])
+        {
+            if (sideClearSince[i] == 0)
+                sideClearSince[i] = now;
+            if (now - sideClearSince[i] >= AVOID_SIDE_CLEAR_HOLD_MS)
+                sideNearFlag[i] = false;
+        }
+    }
 }
 
-// +1 = right, -1 = left: the side with the better score. Within a few seconds
-// of the last avoidance the side used then is kept unless the other is clearly
-// better (so the robot hugs one object instead of flip-flopping).
+static bool sideNear(int dir)
+{
+    return sideNearFlag[dir > 0 ? 1 : 0];
+}
+
+// Free room (cm) on a side, from its camera.
+static float sideRoom(int dir)
+{
+    float d = CamDist_Free(dir > 0 ? CAM_RIGHT : CAM_LEFT);
+
+    if (d < 0.0f) // no fresh reading: judge by the lock flag alone
+        d = sideLocked(dir) ? 0.0f : AVOID_ROOM_DEFAULT_CM;
+    return (d > AVOID_ROOM_CAP_CM) ? AVOID_ROOM_CAP_CM : d;
+}
+
+// Which way to turn round an object: +1 right, -1 left. The side with more
+// room, unless they are about the same - then the side home is on. Within a few
+// seconds of the last object the same way is kept (so it does not flip-flop),
+// as long as that side has not got something close.
 static int chooseAvoidSide()
 {
-    float right = sideScore(1);
-    float left = sideScore(-1);
+    if (avoidLastDir != 0 && millis() - avoidLastMs < AVOID_STICKY_MS && !sideNear(avoidLastDir))
+        return avoidLastDir;
 
-    if (avoidLastDir != 0 && millis() - avoidLastMs < AVOID_STICKY_MS && !sideLocked(avoidLastDir))
+    float right = sideRoom(1);
+    float left = sideRoom(-1);
+
+    if (fabs(right - left) < AVOID_TIE_CM)
     {
-        float cur = (avoidLastDir > 0) ? right : left;
-        float oth = (avoidLastDir > 0) ? left : right;
-        return (oth > cur + AVOID_SWITCH_MARGIN_CM) ? -avoidLastDir : avoidLastDir;
+        float homeError = normalizeAngle(calculateHeadingToHome() - odometry.heading);
+        return (homeError >= 0.0f) ? 1 : -1;
     }
-
-    return (right >= left) ? 1 : -1;
+    return (right > left) ? 1 : -1;
 }
 
-static void startTurn(int dir, bool newEncounter)
+static void startTurn(int dir)
 {
-    if (newEncounter)
-        avoidRot = 0.0f; // flips within one encounter keep counting from the same start
     avoidDir = dir;
     avoidLastDir = dir;
     avoidLastMs = millis();
@@ -199,9 +201,9 @@ static void startTurn(int dir, bool newEncounter)
     float left = CamDist_Free(CAM_LEFT);
     float right = CamDist_Free(CAM_RIGHT);
 
-    Serial.print("NAVIGATION: Object ahead - going round on the ");
+    Serial.print("NAVIGATION: Object ahead - turning ");
     Serial.print(dir > 0 ? "right" : "left");
-    Serial.print(" (free L=");
+    Serial.print(" (room L=");
     if (left >= 0.0f)
         Serial.print(left, 0);
     else
@@ -214,56 +216,18 @@ static void startTurn(int dir, bool newEncounter)
     Serial.println(" cm)");
 }
 
-// A new encounter (or a re-route after passing): forget the angle turned so
-// far, so the side choice is not skewed by the previous one, then pick a side.
-static void startFreshTurn()
-{
-    avoidRot = 0.0f;
-    startTurn(chooseAvoidSide(), true);
-}
-
-// First entry into obstacle avoidance from a driving phase (PURSUIT/PARKING/
-// CREEP): remember which phase to resume once clear.
+// Front locked while a driving phase wanted to go forward: stop and start
+// turning toward the side with more room. `returnState` is the phase to resume.
 static void beginObstacleManeuver(NavigationState returnState)
 {
     avoidReturnState = returnState;
     motion_EmergencyStop(); // instant stop; motion(0) only ramps down per call
     state = NAV_OBSTACLE_AVOID;
-
-    // First contact with this object: back off a little so the turn has room,
-    // but only if the rear camera says it is free. Not repeated while we are
-    // still dealing with the same object.
-    bool sameEncounter = (avoidLastDir != 0) && (millis() - avoidLastMs < AVOID_STICKY_MS);
-    float back = CamDist_Free(CAM_BACK);
-    bool backFree = !backCamLocked && (back < 0.0f || back >= AVOID_BACKUP_MIN_CM);
-
-    if (!sameEncounter && backFree)
-    {
-        avoidPhase = AVOID_BACKUP;
-        avoidBackStartDist = distance.travelled;
-        avoidBackStartMs = millis();
-        avoidLastMs = millis();
-        Serial.println("NAVIGATION: Too close - backing off before turning");
-        return;
-    }
-
-    startFreshTurn();
+    startTurn(chooseAvoidSide());
 }
 
-// The object we are going round sits on the side opposite the way we turned.
-static bool objectSideClear()
-{
-    int objectDir = -avoidDir;
-    float d = CamDist_Free(objectDir > 0 ? CAM_RIGHT : CAM_LEFT);
-
-    if (d >= 0.0f)
-        return d >= AVOID_SIDE_CLEAR_CM;
-
-    return !sideLocked(objectDir);
-}
-
-// Runs one tick of the current obstacle-avoidance sub-phase. Called every
-// loop while state == NAV_OBSTACLE_AVOID.
+// Runs one tick of the turn that follows a front lock. Called every loop while
+// state == NAV_OBSTACLE_AVOID.
 static void updateObstacleAvoid()
 {
     unsigned long now = millis();
@@ -271,25 +235,9 @@ static void updateObstacleAvoid()
 
     switch (avoidPhase)
     {
-    case AVOID_BACKUP:
-    {
-        float backed = distance.travelled - avoidBackStartDist;
-        if (backCamLocked || backed >= AVOID_BACKUP_DIST || now - avoidBackStartMs >= AVOID_BACKUP_MAX_MS)
-        {
-            motion_EmergencyStop();
-            startFreshTurn();
-            break;
-        }
-
-        motion(4); // slow straight backward
-        break;
-    }
-
     case AVOID_TURN:
     {
-        float step = normalizeAngle(odometry.heading - avoidLastHeading);
-        avoidTurned += fabs(step);
-        avoidRot += step; // signed: + = turned right
+        avoidTurned += fabs(normalizeAngle(odometry.heading - avoidLastHeading));
         avoidLastHeading = odometry.heading;
 
         // Never rotate into something beside us: if the side we are turning
@@ -300,7 +248,7 @@ static void updateObstacleAvoid()
             if (!sideLocked(-avoidDir))
             {
                 Serial.println("NAVIGATION: Object beside the turn - switching side");
-                startTurn(-avoidDir, false);
+                startTurn(-avoidDir);
             }
             else if (now - avoidWaitMs >= 2000)
             {
@@ -310,37 +258,30 @@ static void updateObstacleAvoid()
             break;
         }
 
-        // Keep working out which way makes sense: if more turning this way
-        // would run into another object (or needs far more angle) and the other
-        // side is clearly better even after undoing the turn made so far, switch.
-        if (sideScore(-avoidDir) > sideScore(avoidDir) + AVOID_SWITCH_MARGIN_CM)
+        // Another object turned up on the side we are turning toward while the
+        // other side is open: it is less turning to go the other way.
+        if (sideNear(avoidDir) && !sideNear(-avoidDir))
         {
             motion_EmergencyStop();
-            Serial.println("NAVIGATION: Other side is the shorter way round - switching");
-            startTurn(-avoidDir, false);
+            Serial.println("NAVIGATION: Object on the turn side - going the other way");
+            startTurn(-avoidDir);
             break;
         }
 
         if (frontCamLocked)
-        {
             avoidClearSince = 0;
-        }
         else if (avoidClearSince == 0)
-        {
             avoidClearSince = now;
-            avoidClearMark = avoidTurned;
-        }
 
-        // Front has been clear for a moment AND we have turned a margin past
-        // the point where it cleared: stop turning and get ready to pass.
-        if (avoidClearSince != 0 &&
-            now - avoidClearSince >= AVOID_CLEAR_HOLD_MS &&
-            avoidTurned - avoidClearMark >= AVOID_EXTRA_TURN_DEG)
+        // Front has read clear for a moment: stop turning right here. The
+        // driving phase takes over and curves back toward home as soon as the
+        // camera on the home side allows it.
+        if (avoidClearSince != 0 && now - avoidClearSince >= AVOID_TURN_CLEAR_HOLD_MS)
         {
-            motion_EmergencyStop();
             avoidSettleStart = now;
             avoidPhase = AVOID_SETTLE;
-            Serial.println("NAVIGATION: Front clear - settling");
+            avoidRecovering = true;
+            Serial.println("NAVIGATION: Front clear - heading for home");
             break;
         }
 
@@ -348,7 +289,7 @@ static void updateObstacleAvoid()
         if (avoidTurned >= AVOID_SWITCH_AFTER_DEG)
         {
             Serial.println("NAVIGATION: Still blocked after a wide turn - trying the other side");
-            startTurn(-avoidDir, false);
+            startTurn(-avoidDir);
             break;
         }
 
@@ -357,73 +298,81 @@ static void updateObstacleAvoid()
     }
 
     case AVOID_SETTLE:
-        motion_EmergencyStop();
+        motion(0); // ramps the motors down instead of slamming them to a stop
         if (now - avoidSettleStart >= AVOID_SETTLE_MS)
-        {
-            avoidPassStartDist = distance.travelled;
-            avoidClearSince = 0;
-            avoidPhase = AVOID_PASS;
-            Serial.println("NAVIGATION: Passing the object");
-        }
+            state = avoidReturnState; // PURSUIT/PARKING/CREEP heads for home from here
         break;
-
-    case AVOID_PASS:
-    {
-        // Something ahead again (the same object or a new one): pick a side again.
-        if (frontCamLocked)
-        {
-            motion_EmergencyStop();
-            Serial.println("NAVIGATION: Blocked again while passing - re-routing");
-            startFreshTurn();
-            break;
-        }
-
-        float driven = distance.travelled - avoidPassStartDist;
-        bool clearNow = (driven >= AVOID_PASS_MIN_DIST) && objectSideClear();
-
-        if (!clearNow)
-            avoidClearSince = 0;
-        else if (avoidClearSince == 0)
-            avoidClearSince = now;
-
-        if ((avoidClearSince != 0 && now - avoidClearSince >= AVOID_CLEAR_HOLD_MS) ||
-            driven >= AVOID_PASS_MAX_DIST)
-        {
-            Serial.println("NAVIGATION: Clear of the object - resuming route home");
-            state = avoidReturnState; // PURSUIT/PARKING/CREEP steers back toward home
-            break;
-        }
-
-        // Keep watching both sides while passing: steer away from whatever is
-        // close, so the robot's flanks never brush the object (or a second one).
-        int objectDir = -avoidDir;
-        float dObj = CamDist_Free(objectDir > 0 ? CAM_RIGHT : CAM_LEFT);
-        float dTurn = CamDist_Free(avoidDir > 0 ? CAM_RIGHT : CAM_LEFT);
-        bool objNear = (dObj >= 0.0f) ? (dObj < AVOID_SIDE_KEEP_CM) : sideLocked(objectDir);
-        bool turnNear = (dTurn >= 0.0f) ? (dTurn < AVOID_SIDE_KEEP_CM) : sideLocked(avoidDir);
-
-        if (objNear && !turnNear)
-            motion(avoidDir > 0 ? 111 : 121); // gentle curve away from the object
-        else if (turnNear && !objNear)
-            motion(avoidDir > 0 ? 121 : 111); // gentle curve away from what is beside the turn side
-        else
-            motion(3); // slow straight forward
-        break;
-    }
     }
 }
 
-// Runs a motion code for the home-seeking phases unless a camera lock covers
-// it (front: 1/111-130, back: 2/211-230, left: 21-30/121-130/221-230, right:
-// 11-20/111-120/211-220). A blocked code starts going round instead of driving
-// into whatever the side camera sees.
-static void navMotion(int cmd)
+// Runs the motion `cmd` that heads for home, after checking it against the
+// cameras. `headingError` is the signed error to home (+ = home is to the
+// right). See the state comment above for the rules.
+static void navMotion(int cmd, float headingError)
 {
-    if (CamLock_IsBlocked(cmd))
+    const int want = (headingError > 0.0f) ? 1 : -1; // side home lies on
+    const bool straight = (cmd == 1 || cmd == 3);
+    const bool arc = (cmd >= 111 && cmd <= 130);
+    const bool spin = (cmd >= 11 && cmd <= 30);
+
+    updateSideNear();
+
+    // Anything that drives forward needs the front clear.
+    if ((straight || arc) && frontCamLocked)
     {
         beginObstacleManeuver(state);
         return;
     }
+
+    // Back on the line to home: done recovering.
+    if (fabs(headingError) < STRAIGHT_ZONE)
+        avoidRecovering = false;
+
+    // Home is on a side with something close: do not turn toward it, keep
+    // going straight and keep watching that camera. Once it opens up the turn
+    // toward home comes back by itself.
+    static bool holdNoted = false;
+    if (state == NAV_PURSUIT && (arc || spin) && sideNear(want))
+    {
+        if (!holdNoted)
+        {
+            holdNoted = true;
+            Serial.print("NAVIGATION: Object close on the ");
+            Serial.print(want > 0 ? "right" : "left");
+            Serial.println(" - holding straight");
+        }
+        cmd = 1;
+    }
+    else if (!sideNear(want))
+    {
+        holdNoted = false;
+    }
+
+    // In-place turn toward a locked side would swing the robot into it: turn
+    // the other way, or hold still if both sides are locked.
+    if (cmd >= 11 && cmd <= 30 && sideLocked(want))
+    {
+        if (sideLocked(-want))
+        {
+            motion(0);
+            return;
+        }
+        cmd += (want > 0) ? 10 : -10; // 11-20 (right) <-> 21-30 (left)
+    }
+
+    // Just got round something: curve back toward home gently, not sharply.
+    if (avoidRecovering && cmd >= 115 && cmd <= 130)
+        cmd = (want > 0) ? 111 : 121;
+
+    // Something close ahead (not yet locked): crawl instead of full speed, so
+    // the robot can stop short of it.
+    if (cmd == 1)
+    {
+        float front = CamDist_Free(CAM_FRONT);
+        if (front >= 0.0f && front < AVOID_FRONT_SLOW_CM)
+            cmd = 3;
+    }
+
     motion(cmd);
 }
 
@@ -459,6 +408,9 @@ void Navigation_ReturnHome()
         return;
 
     avoidLastDir = 0;
+    avoidRecovering = false;
+    sideNearFlag[0] = sideNearFlag[1] = false;
+    sideClearSince[0] = sideClearSince[1] = 0;
 
     float dx = -odometry.x;
     float dy = -odometry.y;
@@ -493,20 +445,13 @@ void Navigation_Update()
     if (state == NAV_IDLE)
         return;
 
-    // ── OBSTACLE DETECTED: switch into the sidestep maneuver ─────────
-    // Only the driving phases react here — FINAL_ALIGN hands off to Drive
-    // and is covered by Drive's own camera-pause instead.
-    if ((state == NAV_PURSUIT || state == NAV_PARKING || state == NAV_CREEP) && frontCamLocked)
-    {
-        beginObstacleManeuver(state);
-        return;
-    }
-
-    // ── OBSTACLE AVOID: run the turn/advance/turn-back sequence directly.
-    // Keeps retrying (alternating sides) for as long as frontCamLocked is
-    // true — never just stops and waits for the obstacle to move itself.
+    // ── OBSTACLE AVOID: the front locked, so turn toward the side with more
+    // room until it reads clear, then hand straight back to the home-seeking
+    // phase. The driving phases check the cameras themselves (navMotion);
+    // FINAL_ALIGN hands off to Drive and is covered by Drive's own camera-pause.
     if (state == NAV_OBSTACLE_AVOID)
     {
+        updateSideNear();
         updateObstacleAvoid();
         return;
     }
@@ -536,27 +481,27 @@ void Navigation_Update()
         // Select motion code based on heading error magnitude & sign
         if (absError < STRAIGHT_ZONE)
         {
-            navMotion(1); // straight forward (with heading-PID in motion.cpp)
+            navMotion(1, headingError); // straight forward (with heading-PID in motion.cpp)
         }
         else if (absError < ARC_GENTLE_ZONE)
         {
             // Gentle arc — low differential, steady forward speed
-            navMotion(headingError > 0 ? 111 : 121);
+            navMotion(headingError > 0 ? 111 : 121, headingError);
         }
         else if (absError < ARC_MEDIUM_ZONE)
         {
             // Medium arc
-            navMotion(headingError > 0 ? 115 : 125);
+            navMotion(headingError > 0 ? 115 : 125, headingError);
         }
         else if (absError < ARC_TIGHT_ZONE)
         {
             // Tight arc — large differential
-            navMotion(headingError > 0 ? 117 : 127);
+            navMotion(headingError > 0 ? 117 : 127, headingError);
         }
         else
         {
             // Way off course — fall back to in-place turn (arcs can't correct >90°)
-            navMotion(headingError > 0 ? 15 : 25);
+            navMotion(headingError > 0 ? 15 : 25, headingError);
         }
 
         return;
@@ -589,22 +534,22 @@ void Navigation_Update()
         if (absError < PARK_STRAIGHT_ZONE)
         {
             // Nearly on target — use crawl straight forward
-            navMotion(3); // PWM 85 straight
+            navMotion(3, headingError); // PWM 85 straight
         }
         else if (absError < PARK_ARC_ZONE)
         {
             // Moderate correction — gentle arc
-            navMotion(headingError > 0 ? 111 : 121);
+            navMotion(headingError > 0 ? 111 : 121, headingError);
         }
         else
         {
             // Large heading error while parking — in-place turn with enough power to not stall
             if (absError > 15.0f) {
-                navMotion(headingError > 0 ? 15 : 25); // PWM 120
+                navMotion(headingError > 0 ? 15 : 25, headingError); // PWM 120
             } else if (absError > 5.0f) {
-                navMotion(headingError > 0 ? 13 : 23); // PWM 80
+                navMotion(headingError > 0 ? 13 : 23, headingError); // PWM 80
             } else {
-                navMotion(headingError > 0 ? 11 : 21); // PWM 60
+                navMotion(headingError > 0 ? 11 : 21, headingError); // PWM 60
             }
         }
 
@@ -653,17 +598,17 @@ void Navigation_Update()
         {
             // Stop forward motion, align heading with scaled in-place turn to prevent stall
             if (absError > 15.0f) {
-                navMotion(headingError > 0 ? 15 : 25); // PWM 120
+                navMotion(headingError > 0 ? 15 : 25, headingError); // PWM 120
             } else if (absError > 5.0f) {
-                navMotion(headingError > 0 ? 13 : 23); // PWM 80
+                navMotion(headingError > 0 ? 13 : 23, headingError); // PWM 80
             } else {
-                navMotion(headingError > 0 ? 11 : 21); // PWM 60
+                navMotion(headingError > 0 ? 11 : 21, headingError); // PWM 60
             }
         }
         else
         {
             // Heading aligned — inch forward perfectly straight
-            navMotion(3); // PWM 85 straight
+            navMotion(3, headingError); // PWM 85 straight
         }
 
         return;
