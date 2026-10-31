@@ -35,8 +35,8 @@
  *
  * Stopping: 0, any non-motion code, or no command for COMMAND_TIMEOUT_MS -> HARD stop. Both drives get a
  * very steep deceleration (HARD_STOP_RPM_PER_S, the drive's own factory 6084h value), so they brake at their
- * torque limit, i.e. as fast as the motors physically can, then hold position at zero speed (servo stays on).
- * The next motion command ramps normally again.
+ * torque limit, i.e. as fast as the motors physically can. With KILL_ON_STOP the drives are then disabled
+ * (6040h = 0x0000, torque cut, no holding). They re-enable by themselves on the next motion command.
  *
  * Safety (all automatic, no CLI needed):
  *   - Drive watchdog: the Teensy sends a CANopen heartbeat every 100 ms and each drive is set up as its
@@ -79,7 +79,9 @@ static const uint32_t HARD_STOP_RPM_PER_S = 60000;  // hard-stop deceleration. 6
                                                     // 6084h (10,000,000 counts/s^2 at 10000 ppr): steep enough that the
                                                     // drive just brakes at its torque limit. Lower it if a drive trips
                                                     // on DC-bus overvoltage (regen) when stopping from full speed.
-static const uint32_t COMMAND_TIMEOUT_MS = 1000;    // no command for this long -> hard stop (old module: 1000 ms)
+static const uint32_t COMMAND_TIMEOUT_MS = 300;     // no command for this long -> hard stop (old module: 1000 ms). The sender must re-send faster than this.
+static const bool     KILL_ON_STOP     = true;      // on every stop (0, timeout) also disable the drives (6040h = 0x0000): torque is cut at once.
+                                                    // They re-enable by themselves on the next motion command.
 static const uint32_t REFRESH_MS       = 250;       // re-send the current targets this often while moving
 
 static const bool     DRIVE_WATCHDOG   = true;      // drives stop themselves if the Teensy goes silent (1016h)
@@ -763,10 +765,15 @@ static void updateMotion() {
                   moving ? "" : " (hard stop)");
   }
 
+  bool wasMoving = last[0] != 0 || last[1] != 0;
   firstRun = false;
   lastSend = millis();
   if (setSpeeds(want)) {
     for (uint8_t i = 0; i < NUM_DRIVES; i++) last[i] = want[i];
+    if (KILL_ON_STOP && wasMoving && !moving) {
+      writeControlwordAll(0x0000);  // zero speed is already sent; now cut the power stage
+      Serial.println("Drives disabled (stop)");
+    }
   } else {
     Serial.println("Servos would not enable - holding stop, retrying");
     retryAt = millis() + 1000;  // retry in 1 s instead of every loop

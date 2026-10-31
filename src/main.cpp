@@ -13,7 +13,7 @@
  * (101/102 ... 401/402 camera lock codes and 67 are accepted and ignored.)
  *
  * Commands arrive on USB serial (one per line) or I2C slave address 0x72, exactly like the old module.
- * Like the old module, a command has to keep being re-sent: no command for COMMAND_TIMEOUT_MS = stop.
+ * Like the old module, a command has to keep being re-sent: no command for COMMAND_TIMEOUT_MS = hard stop (same as "x").
  *
  * "L" and "R" below are the old module's L/R motor channels, so every PWM table is unchanged.
  * Drive 0 of DRIVE_CFG is channel L, drive 1 is channel R. If the robot turns the wrong way for 11-20 /
@@ -43,7 +43,7 @@ struct DriveConfig { uint8_t port; uint8_t id; int8_t sign; };   // port: 1 = CA
 static const DriveConfig DRIVE_CFG[]   = {{1, 16, +1},      // channel L: drive on CAN1, node ID 16
                                           {2, 16, -1}};     // channel R: drive on CAN2, node ID 16 (mirrored mount)
 static uint32_t       canBaud          = 1000000;   // must match the drives (scan can update it)
-static const int32_t  MAX_RPM          = 255;       // motor rpm that old "PWM 255" corresponds to (255 = rpm equals the old PWM number) - TUNE
+static const int32_t  MAX_RPM          = 638;       // motor rpm that old "PWM 255" corresponds to (straight = PWM 200 -> 500 rpm; every table scales by 638/255) - TUNE
 static const int32_t  BOOST_MAX_RPM    = 0;         // same, but while straight boost (65) is on: straight = this rpm, arcs scale with it.
                                                     // 0 = full speed: the motor's own max speed (2711h) read from the drive.
                                                     // Any value is capped to that max at startup.
@@ -55,7 +55,7 @@ static const uint32_t HARD_STOP_DECEL_RPM_PER_S = 60000;  // deceleration used b
                                                           // drive just brakes at its torque limit, i.e. as fast as it physically can.
                                                           // Too high can trip a DC-bus overvoltage fault from regen - lower it if so.
 static const uint32_t FALLBACK_PPR     = 10000;     // command units per rev if it can't be read
-static const uint32_t COMMAND_TIMEOUT_MS = 1000;    // no command for this long -> stop
+static const uint32_t COMMAND_TIMEOUT_MS = 1000;    // no command for this long -> hard stop
 static const uint32_t REFRESH_MS       = 250;       // re-send the current target this often while moving
 static const uint8_t  I2C_ADDRESS      = 0x72;
 // ----------------------------------------------------
@@ -690,8 +690,11 @@ static void updateMotion() {
 
   if ((int32_t)(millis() - retryAt) < 0) return;  // servos failed to enable recently
   if ((motionCmd != 0 || customMode) && millis() - lastCmdMs > COMMAND_TIMEOUT_MS) {
+    Serial.printf("No command for %lu ms - hard stop\n", (unsigned long)COMMAND_TIMEOUT_MS);
     motionCmd = 0;
     customMode = false;
+    setProfileDecel(true);  // same as the "x" command: steep ramp, then zero speed right away
+    zeroAllTargets();
   }
 
   int32_t want[NUM_DRIVES];
