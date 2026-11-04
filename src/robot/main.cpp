@@ -8,17 +8,18 @@
  * Commands: an ASCII number over I2C, slave address 0x72 (pins 18 SDA / 19 SCL), same as the old module.
  * The sender has to keep re-sending the current command, exactly like before.
  *
- *   0                    stop (hard stop)
+ *   0                    stop (S-curve ramp down)
  *   1 / 2                straight forward / backward            NORMAL_RPM, or BOOST_RPM with boost
  *   3 / 4                slow straight forward / backward
  *   11-20 / 21-30        turn in place (11-20 = right), 3 tiers: x1-x3 slow, x4-x6 mid, x7-x0 fast
  *   31-40 / 41-50        follow-me turns (same directions as 21-30 / 11-20), no boost
  *   111-120 / 121-130    forward arcs,  211-220 / 221-230 backward arcs, 3 tiers each
  *   172 / 174 / 272 / 274  d-pad aliases for 115 / 125 / 215 / 225
+ *   61 / 71              normal speed -100 / +100 rpm, one step per press; saved in EEPROM, kept after power-off
  *   65                   toggle boost: straight 1/2/3/4 and all arcs
  *   66                   toggle turbo turn: in-place turns 11-30
  *   67, 101/102, 201/202, 301/302, 401/402   accepted and ignored (camera codes)
- *   anything else        stop (hard stop)
+ *   anything else        stop (S-curve ramp down)
  *
  * Speeds (motor rpm):
  *   straight 1/2         500 normal, 1000 boost                  (NORMAL_RPM, BOOST_RPM)
@@ -33,17 +34,24 @@
  * at the same moment (a wheel that changes less ramps slower); otherwise going straight -> arc or arc -> arc
  * would briefly swerve because the smaller change finishes first.
  *
- * Stopping: 0, any non-motion code, or no command for COMMAND_TIMEOUT_MS -> HARD stop. Both drives get a
- * very steep deceleration (HARD_STOP_RPM_PER_S, the drive's own factory 6084h value), so they brake at their
- * torque limit, i.e. as fast as the motors physically can. With KILL_ON_STOP the drives are then disabled
- * (6040h = 0x0000, torque cut, no holding). They re-enable by themselves on the next motion command.
+ * Stopping: 0, any non-motion code, or no command for COMMAND_TIMEOUT_MS -> short S-curve ramp to zero over
+ * STOP_RAMP_MS. The Teensy reads each wheel's actual speed (606Ch), then sends a new target every STOP_TICK_MS
+ * following a smoothstep from that speed to 0: firm in the middle, eased at both ends, so it stops fast
+ * without jerking the robot. The drives' own ramps are set very steep (HARD_STOP_RPM_PER_S) so they just
+ * follow those targets. With KILL_ON_STOP the drives are disabled when the ramp ends (6040h = 0x0000, torque
+ * cut). They re-enable by themselves on the next motion command, which also takes over a ramp in progress.
  *
  * Safety (all automatic, no CLI needed):
  *   - Drive watchdog: the Teensy sends a CANopen heartbeat every 100 ms and each drive is set up as its
  *     heartbeat consumer (1016h). If the Teensy hangs or the CAN cable comes off, the drives fault
  *     (Er903 heartbeat timeout) and stop on their own after DRIVE_WATCHDOG_MS.
+ *   - Acknowledgment: every CYCLE_MS the Teensy sends SYNC and each drive answers with its statusword
+ *     (TPDO1, 0x180 + node). A drive that misses MAX_MISSED answers in a row (or never came up) latches an
+ *     EMERGENCY: EMERGENCY_PIN goes HIGH, both wheels get 0 and the drives are disabled; I2C commands are
+ *     ignored. Once every drive answers again, all drives are restarted (NMT reset + full setup + enable,
+ *     the same as a power-up), EMERGENCY_PIN goes LOW and commands work again. No reflash needed.
  *   - A faulted or disabled drive is fault-reset and re-enabled on the next motion command.
- *   - A drive that reboots (boot-up frame) is reconfigured; a drive missing at startup is retried every 2 s.
+ *   - A drive that reboots (boot-up frame) is reconfigured.
  *   - Speeds are capped to the motor's max speed read from the drive (2711h).
  *
  * USB serial (115200) only prints status / faults for debugging; it does not take commands.
@@ -61,6 +69,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <FlexCAN_T4.h>
+#include <EEPROM.h>
 
 // ---------------- User configuration ----------------
 struct DriveConfig { uint8_t port; uint8_t id; int8_t sign; };   // port: 1 = CAN1 (pins 22/23), 2 = CAN2 (pins 1/0)
@@ -69,18 +78,22 @@ static const DriveConfig DRIVE_CFG[]   = {{1, 16, +1},      // channel L: drive 
 static uint32_t       canBaud          = 1000000;   // must match the drives (scanned at boot if nothing answers)
 static const uint8_t  I2C_ADDRESS      = 0x72;
 
-static const int32_t  NORMAL_RPM       = 500;       // straight 1/2; also scales normal turns and arcs
+static const int32_t  NORMAL_RPM       = 500;       // normal speed at power-up: straight 1/2; also scales normal turns and arcs
+static const int32_t  RPM_STEP         = 100;       // 61 lowers / 71 raises the normal speed by this much
+static const int32_t  MIN_NORMAL_RPM   = 100;
+static const int32_t  MAX_NORMAL_RPM   = 3000;      // the motor's own max (2711h) still caps the wheels
 static const int32_t  BOOST_RPM        = 1000;      // straight 1/2 with boost (65); also scales boosted arcs
 static const int32_t  TURBO_TURN_RPM   = 700;       // fastest in-place turn with turbo turn (66)
 
 static const uint32_t RAMP_RPM_PER_S   = 1000;      // speed-change rate of the wheel that changes most
 static const uint32_t MIN_RAMP_RPM_PER_S = 50;      // floor for the slower, synchronised wheel
-static const uint32_t HARD_STOP_RPM_PER_S = 60000;  // hard-stop deceleration. 60000 rpm/s = the drive's own factory
-                                                    // 6084h (10,000,000 counts/s^2 at 10000 ppr): steep enough that the
-                                                    // drive just brakes at its torque limit. Lower it if a drive trips
-                                                    // on DC-bus overvoltage (regen) when stopping from full speed.
-static const uint32_t COMMAND_TIMEOUT_MS = 300;     // no command for this long -> hard stop (old module: 1000 ms). The sender must re-send faster than this.
-static const bool     KILL_ON_STOP     = true;      // on every stop (0, timeout) also disable the drives (6040h = 0x0000): torque is cut at once.
+static const uint32_t HARD_STOP_RPM_PER_S = 60000;  // drive-side ramp while the S-curve stop runs. 60000 rpm/s = the drive's own
+                                                    // factory 6084h (10,000,000 counts/s^2 at 10000 ppr): steep, so the
+                                                    // drive just follows the stepped targets and the S-curve is the shape.
+static const uint32_t STOP_RAMP_MS     = 400;       // S-curve length for a stop. Shorter = harder, longer = gentler.
+static const uint32_t STOP_TICK_MS     = 10;        // new target this often during the stop ramp
+static const uint32_t COMMAND_TIMEOUT_MS = 300;     // no command for this long -> stop (old module: 1000 ms). The sender must re-send faster than this.
+static const bool     KILL_ON_STOP     = true;      // when the stop ramp reaches 0, also disable the drives (6040h = 0x0000): torque is cut.
                                                     // They re-enable by themselves on the next motion command.
 static const uint32_t REFRESH_MS       = 250;       // re-send the current targets this often while moving
 
@@ -88,6 +101,11 @@ static const bool     DRIVE_WATCHDOG   = true;      // drives stop themselves if
 static const uint8_t  MASTER_NODE_ID   = 0x7F;      // heartbeat COB-ID 0x77F; must not clash with a drive ID
 static const uint16_t HEARTBEAT_MS     = 100;
 static const uint16_t DRIVE_WATCHDOG_MS = 500;      // drive faults (Er903) after this long without a heartbeat
+
+static const uint8_t  EMERGENCY_PIN    = 2;         // PLACEHOLDER - set to the pin your senior gives. HIGH = emergency latched, LOW = clear
+static const uint32_t CYCLE_MS         = 20;        // SYNC / acknowledgment cycle
+static const uint8_t  MAX_MISSED       = 10;        // missed acknowledgments in a row -> emergency (10 x 20 ms = 200 ms)
+static const uint32_t RECOVER_POLL_MS  = 500;       // during emergency, check this often whether the drives answer again
 
 static const uint32_t FALLBACK_PPR     = 10000;     // command units per rev if it can't be read
 static const uint32_t OFFLINE_RETRY_MS = 2000;
@@ -110,6 +128,8 @@ struct Drive {
   bool     bootupSeen;
   bool     reportedOffline;
   uint8_t  rpdoType;      // 1 = synchronous, 255 = asynchronous, 0 = RPDO not configured (SDO fallback)
+  bool     acked;         // TPDO1 (statusword) received since the last cycle
+  uint8_t  missed;        // cycles in a row without an acknowledgment
 };
 static Drive drives[NUM_DRIVES];
 
@@ -125,6 +145,8 @@ static const char *canPins(uint8_t port)                   { return port == 2 ? 
 static const uint16_t OD_HEARTBEAT_CONSUMER = 0x1016;  // sub 1: (producer node ID << 16) | timeout ms
 static const uint16_t OD_RPDO1_COMM    = 0x1400;  // sub 1: COB-ID, sub 2: transmission type
 static const uint16_t OD_RPDO1_MAP     = 0x1600;
+static const uint16_t OD_TPDO1_COMM    = 0x1800;  // sub 1: COB-ID, sub 2: transmission type
+static const uint16_t OD_TPDO1_MAP     = 0x1A00;
 static const uint16_t OD_CONTROLWORD   = 0x6040;
 static const uint16_t OD_STATUSWORD    = 0x6041;
 static const uint16_t OD_ERROR_CODE    = 0x603F;
@@ -133,6 +155,7 @@ static const uint16_t OD_PROFILE_ACCEL = 0x6083;
 static const uint16_t OD_PROFILE_DECEL = 0x6084;
 static const uint16_t OD_FEED_CONSTANT = 0x6092;  // sub 1: command units per motor rev
 static const uint16_t OD_TARGET_VEL    = 0x60FF;
+static const uint16_t OD_VELOCITY_ACTUAL = 0x606C;  // counts/s
 static const uint16_t OD_PR0_08        = 0x2008;  // Pr0.08 pulses per rev (overrides 6092h if != 0)
 static const uint16_t OD_MOTOR_RATED_RPM = 0x2710;  // Pr7.10, read-only
 static const uint16_t OD_MOTOR_MAX_RPM   = 0x2711;  // Pr7.11, read-only; drive faults (Er1A0) at 1.2x this
@@ -144,6 +167,7 @@ static const uint8_t NMT_PRE_OP = 0x80;
 static const uint8_t NMT_RESET  = 0x81;
 
 static int32_t motorMaxRpm = 0;  // smallest motor max speed of the online drives, 0 = unknown (no cap)
+static bool emergency = false;   // latched when a drive stops acknowledging; cleared after all drives restart
 
 // ---------------- CAN / CANopen helpers ----------------
 
@@ -177,6 +201,8 @@ static void handleAsyncFrame(uint8_t port, const CAN_message_t &m) {
       d->bootupSeen = true;
       if (d->configured) d->needsSetup = true;  // drive rebooted while running: reconfigure it
     }
+  } else if (m.id > 0x180 && m.id <= 0x1FF) {
+    if (Drive *d = findDrive(port, m.id - 0x180)) d->acked = true;  // TPDO1 = acknowledgment
   } else if (m.id > 0x080 && m.id <= 0x0FF && m.len >= 3) {
     uint16_t code = m.buf[0] | (m.buf[1] << 8);
     Serial.printf("EMCY CAN%u node %lu: error code 0x%04X, error register 0x%02X\n",
@@ -348,6 +374,13 @@ static int32_t rpmToCounts(const Drive &d, int32_t rpm) {
 
 static uint32_t rampToCounts(const Drive &d, uint32_t rpmPerS) {
   return (uint32_t)((uint64_t)rpmPerS * d.countsPerRev / 60);
+}
+
+// Actual wheel speed in rpm (606Ch); `fallback` if the drive doesn't answer.
+static int32_t actualRpm(const Drive &d, int32_t fallback) {
+  int32_t counts;
+  if (!d.online || !sdoRead(d, OD_VELOCITY_ACTUAL, 0, counts, true)) return fallback;
+  return (int32_t)((int64_t)counts * 60 / (int64_t)d.countsPerRev);
 }
 
 static bool anyOnline() {
@@ -524,6 +557,17 @@ static void configureRpdo1(Drive &d) {
   if (!sdoWrite(d, OD_RPDO1_COMM, 1, cobId, 4)) d.rpdoType = 0;
 }
 
+// TPDO1 = statusword (6041h), sent by the drive after every SYNC: its acknowledgment each cycle.
+static bool configureTpdo1(Drive &d) {
+  const uint32_t cobId = 0x180u + d.id;
+  return sdoWrite(d, OD_TPDO1_COMM, 1, 0x80000000u | cobId, 4) &&  // disable PDO while editing
+         sdoWrite(d, OD_TPDO1_MAP, 0, 0, 1) &&
+         sdoWrite(d, OD_TPDO1_MAP, 1, ((uint32_t)OD_STATUSWORD << 16) | 0x10, 4) &&
+         sdoWrite(d, OD_TPDO1_MAP, 0, 1, 1) &&
+         sdoWrite(d, OD_TPDO1_COMM, 2, 1, 1) &&                    // send after every SYNC
+         sdoWrite(d, OD_TPDO1_COMM, 1, cobId, 4);
+}
+
 // Brings one drive from power-up (or reboot) to ready: everything that is lost when a drive restarts.
 static bool setupDrive(Drive &d) {
   d.configured = false;
@@ -554,6 +598,8 @@ static bool setupDrive(Drive &d) {
   sdoWrite(d, OD_MODE_OF_OP, 0, MODE_PROFILE_VELOCITY, 1);
   configureRpdo1(d);
   if (d.rpdoType == 0) Serial.printf("CAN%u node %u: RPDO setup failed, using SDO (not simultaneous)\n", d.port, d.id);
+  if (!configureTpdo1(d))
+    Serial.printf("CAN%u node %u: TPDO1 setup failed - no acknowledgment, emergency will trip\n", d.port, d.id);
 
   if (DRIVE_WATCHDOG) {
     if (sdoWrite(d, OD_HEARTBEAT_CONSUMER, 1, ((uint32_t)MASTER_NODE_ID << 16) | DRIVE_WATCHDOG_MS, 4))
@@ -565,6 +611,8 @@ static bool setupDrive(Drive &d) {
 
   sendNmt(d.port, NMT_START, d.id);  // PDOs only work in NMT operational
   d.targetRpm = 0;
+  d.acked = false;
+  d.missed = 0;
   d.configured = true;
   updateMotorMaxRpm();
   return true;
@@ -633,10 +681,82 @@ static void maintainDrives() {
     if (!d.online && setupDrive(d)) Serial.printf("CAN%u node %u: drive found\n", d.port, d.id);
 }
 
+// ---------------- Acknowledgment / emergency ----------------
+
+static void enterEmergency() {
+  emergency = true;
+  digitalWrite(EMERGENCY_PIN, HIGH);
+  zeroAllTargets();
+  writeControlwordAll(0x0000);
+  Serial.println("EMERGENCY latched - drives stopped and disabled, waiting for them to answer again");
+}
+
+// Every CYCLE_MS: count drives that did not acknowledge the last SYNC, then send the next SYNC.
+static void ackTick() {
+  static uint32_t last = 0;
+  if (millis() - last < CYCLE_MS) return;
+  last = millis();
+  bool lost = false;
+  for (Drive &d : drives) {
+    d.missed = d.acked ? 0 : (d.missed < 255 ? d.missed + 1 : 255);
+    d.acked = false;
+    if (d.missed < MAX_MISSED) continue;
+    Serial.printf("CAN%u node %u: no acknowledgment for %u cycles\n", d.port, d.id, MAX_MISSED);
+    d.online = false;      // stop talking to it (no SDO timeouts, no heartbeat on a dead bus)
+    d.configured = false;
+    lost = true;
+  }
+  if (lost) {
+    enterEmergency();
+    return;
+  }
+  bool sent[3] = {false, false, false};
+  for (Drive &d : drives) {
+    if (!d.configured || sent[d.port]) continue;
+    sendSync(d.port);
+    sent[d.port] = true;
+  }
+}
+
+// During an emergency: once every drive answers again, restart all of them like a power-up and clear it.
+static void recoverTick() {
+  static uint32_t last = 0;
+  if (millis() - last < RECOVER_POLL_MS) return;
+  last = millis();
+  for (Drive &d : drives) {
+    int32_t sw;
+    if (!sdoRead(d, OD_STATUSWORD, 0, sw, true)) return;
+  }
+  Serial.println("All drives answering again - restarting them");
+  initDrives();
+  for (Drive &d : drives)
+    if (!d.online) return;
+  if (!servoEnableAll()) return;
+  emergency = false;
+  digitalWrite(EMERGENCY_PIN, LOW);
+  Serial.println("Emergency cleared - ready for commands");
+}
+
 // ---------------- Motion commands -> wheel speeds ----------------
 
 static bool turnBoost = false;      // 66 toggles (turbo turn)
 static bool straightBoost = false;  // 65 toggles (straight + arcs)
+static int32_t normalRpm = NORMAL_RPM;  // current normal speed; 61 = -RPM_STEP, 71 = +RPM_STEP. Saved in EEPROM.
+
+struct SavedSpeed { uint32_t magic; int32_t rpm; };
+static const uint32_t SAVED_SPEED_MAGIC = 0x52504D31;  // "RPM1": marks a valid saved value
+static const int      SAVED_SPEED_ADDR  = 0;
+
+static void loadNormalRpm() {
+  SavedSpeed s;
+  EEPROM.get(SAVED_SPEED_ADDR, s);
+  if (s.magic == SAVED_SPEED_MAGIC && s.rpm >= MIN_NORMAL_RPM && s.rpm <= MAX_NORMAL_RPM) normalRpm = s.rpm;
+}
+
+static void saveNormalRpm() {
+  SavedSpeed s = {SAVED_SPEED_MAGIC, normalRpm};
+  EEPROM.put(SAVED_SPEED_ADDR, s);  // only rewrites bytes that changed
+}
 
 // The old module's PWM figures, signed (+ = forward), plus the scale that turns them into rpm:
 // rpm = pwm * scaleRpm / scalePwm. Keeping the old figures keeps every code's left/right proportions.
@@ -659,10 +779,10 @@ static const int ARC_BWD_B[3][4] = {{170, 125, 120, 90}, {200, 150, 120, 90}, {2
 static const int TURN_PWM[3][2]  = {{80, 60}, {120, 80}, {180, 120}};                                // {turbo, normal}
 static const int FOLLOW_TURN_PWM[3] = {90, 130, 190};                                                // 31-50
 
-// Straight, slow straight and arcs: boosted by 65. Old straight PWM 200 = NORMAL_RPM, PWM 255 = BOOST_RPM.
+// Straight, slow straight and arcs: boosted by 65. Old straight PWM 200 = normalRpm, PWM 255 = BOOST_RPM.
 static Wheels straightGroup(int pwmL, int pwmR) {
   if (straightBoost) return {pwmL, pwmR, BOOST_RPM, 255};
-  return {pwmL, pwmR, NORMAL_RPM, 200};
+  return {pwmL, pwmR, normalRpm, 200};
 }
 
 static Wheels arc(const int t[3][4], int cmd, int lo, int dir) {
@@ -674,12 +794,12 @@ static Wheels arc(const int t[3][4], int cmd, int lo, int dir) {
 static Wheels turnInPlace(int cmd, int lo, int dir) {
   int t = tierOf(cmd, lo);
   if (turnBoost) return {dir * TURN_PWM[t][0], -dir * TURN_PWM[t][0], TURBO_TURN_RPM, 180};
-  return {dir * TURN_PWM[t][1], -dir * TURN_PWM[t][1], NORMAL_RPM, 200};
+  return {dir * TURN_PWM[t][1], -dir * TURN_PWM[t][1], normalRpm, 200};
 }
 
 static Wheels followTurn(int cmd, int lo, int dir) {
   int p = FOLLOW_TURN_PWM[tierOf(cmd, lo)];
-  return {dir * p, -dir * p, NORMAL_RPM, 200};
+  return {dir * p, -dir * p, normalRpm, 200};
 }
 
 // Fills `w` for a motion code. Returns false for 0 and anything that is not a motion (= stop).
@@ -721,7 +841,19 @@ static bool isIgnoredCode(int v) {
 
 static void setCommand(int v) {
   static uint32_t boostTimer = 0;
+  static int prev = 0;
   if (isIgnoredCode(v)) return;
+  bool newPress = v != prev;
+  prev = v;
+  if (v == 61 || v == 71) {  // speed down / up, one step per press (the sender repeats the code while held)
+    if (newPress) {
+      normalRpm = constrain(normalRpm + (v == 71 ? RPM_STEP : -RPM_STEP), MIN_NORMAL_RPM, MAX_NORMAL_RPM);
+      saveNormalRpm();
+      Serial.printf("Normal speed now %ld rpm (saved)\n", (long)normalRpm);
+    }
+    lastCmdMs = millis();  // keep the current motion alive, like 65/66
+    return;
+  }
   if (v == 65 || v == 66) {  // toggles; debounced because the sender keeps repeating the code
     if (millis() - boostTimer >= 500) {
       boostTimer = millis();
@@ -742,38 +874,74 @@ static void updateMotion() {
   static uint32_t lastSend = 0;
   static uint32_t retryAt = 0;
   static bool firstRun = true;
+  static bool stopping = false;
+  static uint32_t stopStart = 0;
+  static uint32_t stopTick = 0;
+  static int32_t stopFrom[NUM_DRIVES] = {0};
 
+  if (emergency) {  // already stopped by enterEmergency(); start clean after the restart
+    for (uint8_t i = 0; i < NUM_DRIVES; i++) last[i] = 0;
+    stopping = false;
+    firstRun = true;
+    return;
+  }
   if ((int32_t)(millis() - retryAt) < 0) return;  // servos failed to enable recently
   if (motionCmd != 0 && millis() - lastCmdMs > COMMAND_TIMEOUT_MS) {
-    Serial.printf("No command for %lu ms - hard stop\n", (unsigned long)COMMAND_TIMEOUT_MS);
+    Serial.printf("No command for %lu ms - stopping\n", (unsigned long)COMMAND_TIMEOUT_MS);
     motionCmd = 0;
   }
 
-  Wheels w = {0, 0, NORMAL_RPM, 200};
-  if (!motionToWheels(motionCmd, w)) w = {0, 0, NORMAL_RPM, 200};
+  Wheels w = {0, 0, normalRpm, 200};
+  if (!motionToWheels(motionCmd, w)) w = {0, 0, normalRpm, 200};
   int32_t want[NUM_DRIVES] = {wheelRpm(w.pwmL, w, DRIVE_CFG[0].sign), wheelRpm(w.pwmR, w, DRIVE_CFG[1].sign)};
+
+  bool moving = want[0] != 0 || want[1] != 0;
+  bool wasMoving = last[0] != 0 || last[1] != 0;
+
+  if (!moving && wasMoving) {  // S-curve from the current speed down to 0
+    if (!stopping) {
+      stopping = true;
+      stopStart = millis();
+      for (uint8_t i = 0; i < NUM_DRIVES; i++) stopFrom[i] = actualRpm(drives[i], last[i]);
+      setHardStopRamps();
+      Serial.printf("cmd %d -> stop from L %ld rpm, R %ld rpm over %lu ms\n", motionCmd, (long)stopFrom[0],
+                    (long)stopFrom[1], (unsigned long)STOP_RAMP_MS);
+    } else if (millis() - stopTick < STOP_TICK_MS) {
+      return;
+    }
+    stopTick = millis();
+    float x = min(1.0f, (float)(millis() - stopStart) / (float)STOP_RAMP_MS);
+    float k = 1.0f - x * x * (3.0f - 2.0f * x);  // smoothstep, 1 -> 0
+    int32_t step[NUM_DRIVES];
+    for (uint8_t i = 0; i < NUM_DRIVES; i++) step[i] = x >= 1.0f ? 0 : (int32_t)(stopFrom[i] * k);
+    applySpeeds(step);
+    for (uint8_t i = 0; i < NUM_DRIVES; i++) last[i] = step[i];
+    if (x >= 1.0f) {
+      stopping = false;
+      if (KILL_ON_STOP) {
+        writeControlwordAll(0x0000);  // zero speed is already sent; now cut the power stage
+        Serial.println("Drives disabled (stop)");
+      }
+    }
+    return;
+  }
+  stopping = false;  // a new motion command takes over a stop ramp in progress
 
   bool changed = firstRun;
   for (uint8_t i = 0; i < NUM_DRIVES; i++) changed |= want[i] != last[i];
-  bool moving = want[0] != 0 || want[1] != 0;
   if (!changed && !(moving && millis() - lastSend >= REFRESH_MS)) return;
 
   if (changed) {
     if (moving) setSyncedRamps(last, want);
     else        setHardStopRamps();
     Serial.printf("cmd %d -> L %ld rpm, R %ld rpm%s\n", motionCmd, (long)want[0], (long)want[1],
-                  moving ? "" : " (hard stop)");
+                  moving ? "" : " (stop)");
   }
 
-  bool wasMoving = last[0] != 0 || last[1] != 0;
   firstRun = false;
   lastSend = millis();
   if (setSpeeds(want)) {
     for (uint8_t i = 0; i < NUM_DRIVES; i++) last[i] = want[i];
-    if (KILL_ON_STOP && wasMoving && !moving) {
-      writeControlwordAll(0x0000);  // zero speed is already sent; now cut the power stage
-      Serial.println("Drives disabled (stop)");
-    }
   } else {
     Serial.println("Servos would not enable - holding stop, retrying");
     retryAt = millis() + 1000;  // retry in 1 s instead of every loop
@@ -814,8 +982,9 @@ static void handleI2c() {
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 1000) {}
+  loadNormalRpm();
   Serial.printf("Motion Module ROBOT build (I2C 0x%02X), %u drives, normal %ld / boost %ld / turbo turn %ld rpm\n",
-                I2C_ADDRESS, NUM_DRIVES, (long)NORMAL_RPM, (long)BOOST_RPM, (long)TURBO_TURN_RPM);
+                I2C_ADDRESS, NUM_DRIVES, (long)normalRpm, (long)BOOST_RPM, (long)TURBO_TURN_RPM);
 
   for (uint8_t i = 0; i < NUM_DRIVES; i++) {
     drives[i] = {};
@@ -823,6 +992,9 @@ void setup() {
     drives[i].port = DRIVE_CFG[i].port;
     drives[i].countsPerRev = FALLBACK_PPR;
   }
+
+  pinMode(EMERGENCY_PIN, OUTPUT);
+  digitalWrite(EMERGENCY_PIN, LOW);
 
   can1.begin();
   can2.begin();
@@ -840,6 +1012,11 @@ void setup() {
 void loop() {
   pollCan();         // also sends the heartbeat
   handleI2c();       // before updateMotion(), so a command that arrived during a long wait isn't timed out
-  maintainDrives();
+  if (emergency) {
+    recoverTick();
+  } else {
+    maintainDrives();
+    ackTick();
+  }
   updateMotion();
 }
