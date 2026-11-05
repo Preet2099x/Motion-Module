@@ -5,10 +5,11 @@
  * Same motion command numbers as the old PWM module, now turned into wheel RPM:
  *   0              stop
  *   1 / 2          straight forward / backward
- *   11-20          turn right in place      21-30    turn left in place
+ *   11-20          turn left in place       21-30    turn right in place
  *   111-120        forward arc right        121-130  forward arc left
  *   211-220        backward arc             221-230  backward arc (mirror of 211-220)
  *   172/174/272/274  d-pad aliases for 115/125/215/225
+ *   61 / 71        normal speed -100 / +100 rpm per press; back to 500 rpm after 5000 ms of 0
  *   65 / 66        toggle straight boost / turn boost
  * (101/102 ... 401/402 camera lock codes and 67 are accepted and ignored.)
  *
@@ -595,6 +596,14 @@ static int32_t boostMaxRpm() {
   return motorMaxRpm > 0 ? motorMaxRpm : BOOST_FALLBACK_RPM;
 }
 
+// 61 / 71: normal straight speed -100 / +100 rpm per press (straight = PWM 200 = 500 rpm, so MAX_RPM scales by 255/200).
+// After SPEED_REVERT_MS of 0 / no command it returns to the default 500 rpm.
+static const int32_t  DEFAULT_NORMAL_RPM = 500, RPM_STEP = 100, MIN_NORMAL_RPM = 100, MAX_NORMAL_RPM = 3000;
+static const uint32_t SPEED_REVERT_MS = 5000;
+static int32_t  normalRpm = DEFAULT_NORMAL_RPM;
+static uint32_t lastSpeedKeyMs = 0;
+static int32_t normalMaxRpm() { return MAX_RPM + (normalRpm - DEFAULT_NORMAL_RPM) * 255 / 200; }
+
 static int pick(int boost, int normal, bool useBoost) { return useBoost ? boost : normal; }
 
 // Which of the 3 speed tiers a code falls in; `lo` is the first code of its 10-code range.
@@ -614,12 +623,12 @@ static const int TURN_PWM[3][2]  = {{80, 60}, {120, 80}, {180, 120}};           
 static Wheels arc(const int t[3][4], int cmd, int lo, int dir) {
   const int *row = t[tierOf(cmd, lo)];
   return {dir * pick(row[0], row[1], straightBoost), dir * pick(row[2], row[3], straightBoost),
-          straightBoost ? boostMaxRpm() : MAX_RPM};
+          straightBoost ? boostMaxRpm() : normalMaxRpm()};
 }
 
 static Wheels turnInPlace(int cmd, int lo, int dir) {  // dir +1: L forward / R backward
   int p = pick(TURN_PWM[tierOf(cmd, lo)][0], TURN_PWM[tierOf(cmd, lo)][1], turnBoost);
-  return {dir * p, -dir * p, MAX_RPM};
+  return {dir * p, -dir * p, normalMaxRpm()};
 }
 
 // Fills `w` for a motion code. Returns false for codes that are not (or no longer) a motion.
@@ -632,15 +641,15 @@ static bool motionToWheels(int cmd, Wheels &w) {
 
   if (cmd == 1 || cmd == 2) {
     int p = straightBoost ? 255 : 200;
-    w = {cmd == 1 ? p : -p, cmd == 1 ? p : -p, straightBoost ? boostMaxRpm() : MAX_RPM};
+    w = {cmd == 1 ? p : -p, cmd == 1 ? p : -p, straightBoost ? boostMaxRpm() : normalMaxRpm()};
     return true;
   }
-  if (cmd >= 11  && cmd <= 20)  { w = turnInPlace(cmd, 11, -1); return true; }  // right: L back, R fwd
-  if (cmd >= 21  && cmd <= 30)  { w = turnInPlace(cmd, 21, +1); return true; }  // left:  L fwd,  R back
-  if (cmd >= 111 && cmd <= 120) { w = arc(ARC_FWD_A, cmd, 111, +1); return true; }
-  if (cmd >= 121 && cmd <= 130) { w = arc(ARC_FWD_B, cmd, 121, +1); return true; }
-  if (cmd >= 211 && cmd <= 220) { w = arc(ARC_BWD_A, cmd, 211, -1); return true; }
-  if (cmd >= 221 && cmd <= 230) { w = arc(ARC_BWD_B, cmd, 221, -1); return true; }
+  if (cmd >= 11  && cmd <= 20)  { w = turnInPlace(cmd, 11, +1); return true; }  // swapped with 21-30: L fwd, R back
+  if (cmd >= 21  && cmd <= 30)  { w = turnInPlace(cmd, 21, -1); return true; }  // swapped with 11-20: L back, R fwd
+  if (cmd >= 111 && cmd <= 120) { w = arc(ARC_FWD_B, cmd, 111, +1); return true; }
+  if (cmd >= 121 && cmd <= 130) { w = arc(ARC_FWD_A, cmd, 121, +1); return true; }
+  if (cmd >= 211 && cmd <= 220) { w = arc(ARC_BWD_B, cmd, 211, -1); return true; }
+  if (cmd >= 221 && cmd <= 230) { w = arc(ARC_BWD_A, cmd, 221, -1); return true; }
   return false;  // 0 and anything unknown = stop
 }
 
@@ -663,14 +672,26 @@ static bool isIgnoredCode(int v) {
 
 static void setCommand(int v) {
   static uint32_t boostTimer = 0;
+  static int prev = 0;
   if (isIgnoredCode(v)) return;
+  if (v != 0) lastSpeedKeyMs = millis();
+  bool newPress = v != prev;
+  prev = v;
+  if (v == 61 || v == 71) {  // speed down / up, one step per press (the sender repeats the code while held)
+    if (newPress) {
+      normalRpm = constrain(normalRpm + (v == 71 ? RPM_STEP : -RPM_STEP), MIN_NORMAL_RPM, MAX_NORMAL_RPM);
+      Serial.printf("Normal speed now %ld rpm\n", (long)normalRpm);
+    }
+    lastCmdMs = millis();  // keep the current motion alive, like 65/66
+    return;
+  }
   if (v == 65 || v == 66) {  // toggles; debounced because the sender keeps repeating the code
     if (millis() - boostTimer >= 500) {
       boostTimer = millis();
       if (v == 65) straightBoost = !straightBoost;
       else         turnBoost = !turnBoost;
       Serial.printf("Boost: straight %s (%ld rpm), turn %s\n", straightBoost ? "ON" : "OFF",
-                    (long)(straightBoost ? boostMaxRpm() : MAX_RPM), turnBoost ? "ON" : "OFF");
+                    (long)(straightBoost ? boostMaxRpm() : normalMaxRpm()), turnBoost ? "ON" : "OFF");
     }
     lastCmdMs = millis();  // keep the current motion alive, like the old module
     return;
@@ -683,6 +704,10 @@ static void setCommand(int v) {
 
 // Turns the current command into drive targets and sends them when they change (or periodically).
 static void updateMotion() {
+  if (normalRpm != DEFAULT_NORMAL_RPM && millis() - lastSpeedKeyMs >= SPEED_REVERT_MS) {
+    normalRpm = DEFAULT_NORMAL_RPM;
+    Serial.printf("No command for 5 s - normal speed back to %ld rpm\n", (long)normalRpm);
+  }
   static int32_t last[NUM_DRIVES] = {0};
   static uint32_t lastSend = 0;
   static uint32_t retryAt = 0;
@@ -702,8 +727,8 @@ static void updateMotion() {
     want[0] = DRIVE_CFG[0].sign * customL;
     want[1] = DRIVE_CFG[1].sign * customR;
   } else {
-    Wheels w = {0, 0, MAX_RPM};
-    if (!motionToWheels(motionCmd, w)) w = {0, 0, MAX_RPM};
+    Wheels w = {0, 0, normalMaxRpm()};
+    if (!motionToWheels(motionCmd, w)) w = {0, 0, normalMaxRpm()};
     want[0] = pwmToRpm(w.pwmL, DRIVE_CFG[0].sign, w.maxRpm);
     want[1] = pwmToRpm(w.pwmR, DRIVE_CFG[1].sign, w.maxRpm);
   }

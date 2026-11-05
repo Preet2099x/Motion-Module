@@ -1,0 +1,5 @@
+{
+  "terminal.integrated.env.windows": {
+    "PATH": "${env:USERPROFILE}\\.platformio\\penv\\Scripts;${env:PATH}"
+  }
+}

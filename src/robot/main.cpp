@@ -11,11 +11,11 @@
  *   0                    stop (S-curve ramp down)
  *   1 / 2                straight forward / backward            NORMAL_RPM, or BOOST_RPM with boost
  *   3 / 4                slow straight forward / backward
- *   11-20 / 21-30        turn in place (11-20 = right), 3 tiers: x1-x3 slow, x4-x6 mid, x7-x0 fast
+ *   11-20 / 21-30        turn in place (11-20 = left, 21-30 = right), 3 tiers: x1-x3 slow, x4-x6 mid, x7-x0 fast
  *   31-40 / 41-50        follow-me turns (same directions as 21-30 / 11-20), no boost
  *   111-120 / 121-130    forward arcs,  211-220 / 221-230 backward arcs, 3 tiers each
  *   172 / 174 / 272 / 274  d-pad aliases for 115 / 125 / 215 / 225
- *   61 / 71              normal speed -100 / +100 rpm, one step per press; saved in EEPROM, kept after power-off
+ *   61 / 71              normal speed -100 / +100 rpm, one step per press; returns to 500 rpm after 5000 ms of 0
  *   65                   toggle boost: straight 1/2/3/4 and all arcs
  *   66                   toggle turbo turn: in-place turns 11-30
  *   67, 101/102, 201/202, 301/302, 401/402   accepted and ignored (camera codes)
@@ -104,6 +104,7 @@ static const uint16_t DRIVE_WATCHDOG_MS = 500;      // drive faults (Er903) afte
 
 static const uint8_t  EMERGENCY_PIN    = 2;         // PLACEHOLDER - set to the pin your senior gives. HIGH = emergency latched, LOW = clear
 static const uint32_t CYCLE_MS         = 20;        // SYNC / acknowledgment cycle
+static const uint32_t SPEED_REVERT_MS  = 5000;      // this long with only 0 (no command) -> the speed returns to NORMAL_RPM
 static const uint8_t  MAX_MISSED       = 10;        // missed acknowledgments in a row -> emergency (10 x 20 ms = 200 ms)
 static const uint32_t RECOVER_POLL_MS  = 500;       // during emergency, check this often whether the drives answer again
 
@@ -772,7 +773,7 @@ static int tierOf(int cmd, int lo) {
 }
 
 // {L boost, L normal, R boost, R normal}
-static const int ARC_FWD_A[3][4] = {{120, 90, 170, 125}, {150, 115, 200, 150}, {80, 60, 240, 180}};  // 111-120
+static const int ARC_FWD_A[3][4] = {{120, 90, 170, 125}, {150, 115, 200, 150}, {80, 60, 240, 180}};  // now used by 121-130
 static const int ARC_FWD_B[3][4] = {{170, 125, 120, 90}, {200, 150, 150, 115}, {240, 180, 80, 60}};  // 121-130
 static const int ARC_BWD_A[3][4] = {{120, 90, 170, 125}, {120, 90, 200, 150}, {80, 60, 240, 180}};   // 211-220
 static const int ARC_BWD_B[3][4] = {{170, 125, 120, 90}, {200, 150, 120, 90}, {240, 180, 80, 60}};   // 221-230
@@ -815,14 +816,14 @@ static bool motionToWheels(int cmd, Wheels &w) {
     w = straightGroup(s * p, s * p);
     return true;
   }
-  if (cmd >= 11  && cmd <= 20)  { w = turnInPlace(cmd, 11, -1); return true; }  // right: L back, R fwd
-  if (cmd >= 21  && cmd <= 30)  { w = turnInPlace(cmd, 21, +1); return true; }  // left:  L fwd,  R back
+  if (cmd >= 11  && cmd <= 20)  { w = turnInPlace(cmd, 11, +1); return true; }  // swapped with 21-30: L fwd, R back
+  if (cmd >= 21  && cmd <= 30)  { w = turnInPlace(cmd, 21, -1); return true; }  // swapped with 11-20: L back, R fwd
   if (cmd >= 31  && cmd <= 40)  { w = followTurn(cmd, 31, +1);  return true; }
   if (cmd >= 41  && cmd <= 50)  { w = followTurn(cmd, 41, -1);  return true; }
-  if (cmd >= 111 && cmd <= 120) { w = arc(ARC_FWD_A, cmd, 111, +1); return true; }
-  if (cmd >= 121 && cmd <= 130) { w = arc(ARC_FWD_B, cmd, 121, +1); return true; }
-  if (cmd >= 211 && cmd <= 220) { w = arc(ARC_BWD_A, cmd, 211, -1); return true; }
-  if (cmd >= 221 && cmd <= 230) { w = arc(ARC_BWD_B, cmd, 221, -1); return true; }
+  if (cmd >= 111 && cmd <= 120) { w = arc(ARC_FWD_B, cmd, 111, +1); return true; }
+  if (cmd >= 121 && cmd <= 130) { w = arc(ARC_FWD_A, cmd, 121, +1); return true; }
+  if (cmd >= 211 && cmd <= 220) { w = arc(ARC_BWD_B, cmd, 211, -1); return true; }
+  if (cmd >= 221 && cmd <= 230) { w = arc(ARC_BWD_A, cmd, 221, -1); return true; }
   return false;
 }
 
@@ -839,10 +840,22 @@ static bool isIgnoredCode(int v) {
   return v == 67 || ((v % 100 == 1 || v % 100 == 2) && v >= 101 && v <= 402);
 }
 
+static uint32_t lastSpeedKeyMs = 0;  // last time any non-zero command was received
+
+// After SPEED_REVERT_MS of 0 / no command, the normal speed goes back to NORMAL_RPM.
+static void revertSpeedIfReleased() {
+  if (normalRpm == NORMAL_RPM) return;
+  if (millis() - lastSpeedKeyMs < SPEED_REVERT_MS) return;
+  normalRpm = NORMAL_RPM;
+  saveNormalRpm();
+  Serial.printf("No command for 5 s - normal speed back to %ld rpm\n", (long)normalRpm);
+}
+
 static void setCommand(int v) {
   static uint32_t boostTimer = 0;
   static int prev = 0;
   if (isIgnoredCode(v)) return;
+  if (v != 0) lastSpeedKeyMs = millis();
   bool newPress = v != prev;
   prev = v;
   if (v == 61 || v == 71) {  // speed down / up, one step per press (the sender repeats the code while held)
@@ -870,6 +883,7 @@ static void setCommand(int v) {
 
 // Turns the current command into drive targets and sends them when they change (or periodically).
 static void updateMotion() {
+  revertSpeedIfReleased();
   static int32_t last[NUM_DRIVES] = {0};
   static uint32_t lastSend = 0;
   static uint32_t retryAt = 0;

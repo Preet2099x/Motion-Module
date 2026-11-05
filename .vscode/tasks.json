@@ -1,0 +1,35 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "PIO Build (bench)",
+      "type": "shell",
+      "command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+      "args": ["run", "-e", "teensy40"],
+      "group": "build",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "PIO Build (robot)",
+      "type": "shell",
+      "command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+      "args": ["run", "-e", "robot"],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "PIO Upload (bench)",
+      "type": "shell",
+      "command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+      "args": ["run", "-e", "teensy40", "-t", "upload"],
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "PIO Upload (robot)",
+      "type": "shell",
+      "command": "${userHome}/.platformio/penv/Scripts/platformio.exe",
+      "args": ["run", "-e", "robot", "-t", "upload"],
+      "problemMatcher": ["$gcc"]
+    }
+  ]
+}
